@@ -280,11 +280,16 @@ def test_guided_retries_when_output_too_short(guard: FileSystemGuard,
 
 def test_guided_retries_when_output_is_copy(guard: FileSystemGuard,
                                              source_workspace: Path):
-    """Первый ответ — точная подстрока исходника, retry."""
-    # "Текст для первого заголовка." есть в исходнике.
+    """Первый ответ — точная подстрока исходника, срабатывает copy-детектор.
+
+    Строка «Это тестовый файл с несколькими строками.» содержится
+    в input/article.md дословно. Её длина (41) выше length-порога,
+    поэтому retry вызывается именно проверкой копирования, а не
+    длиной.
+    """
     client = ScriptedClient(
-        "Текст для первого заголовка.",
-        "Документ описывает структуру с двумя разделами.",
+        "Это тестовый файл с несколькими строками.",
+        "Документ описывает тестовую структуру с двумя разделами.",
     )
     agent = _make_agent(guard, source_workspace, client)
     result = agent.run(
