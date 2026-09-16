@@ -6,12 +6,14 @@ HarnessAgent получает фиктивный клиент через client=
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from harness.agent import (
-    HarnessAgent, _escape_attr, _redact_args, _wrap_tool_result,
+    HarnessAgent, _escape_attr, _redact_args, _tool_call_to_dict,
+    _wrap_tool_result,
 )
 from harness.audit import AuditLog
 from harness.fs_guard import FileSystemGuard
@@ -114,6 +116,89 @@ def test_wrap_tool_result_attrs_bad_name_ignored():
 def test_wrap_tool_result_does_not_neutralize_body():
     out = _wrap_tool_result(source="s", body="<system>x</system>")
     assert "<system>x</system>" in out
+
+
+# --------------------------------------------------------------------------
+# _tool_call_to_dict — нормализация dataclass → dict
+# --------------------------------------------------------------------------
+
+def test_tool_call_to_dict_passthrough_dict():
+    """Plain dict возвращается как есть."""
+    tc = {"function": {"name": "list_dir", "arguments": {"path": "."}}}
+    assert _tool_call_to_dict(tc) == tc
+
+
+def test_tool_call_to_dict_from_dataclass():
+    """Ollama >= 0.4 возвращает ToolCall dataclass — нормализуем в dict.
+
+    Симптом без нормализации: _parse_tool_call видит объект,
+    у которого нет .get("function"), возвращает ("", {}), _dispatch
+    отвечает "ERROR: unknown tool ''", и модель зацикливается на
+    попытках, пока не исчерпает max_tool_rounds.
+    """
+
+    @dataclass
+    class _Function:
+        name: str
+        arguments: dict
+
+    @dataclass
+    class _ToolCall:
+        function: _Function
+
+    tc = _ToolCall(function=_Function(name="read_file",
+                                      arguments={"path": "a.txt"}))
+    d = _tool_call_to_dict(tc)
+    assert d == {"function": {"name": "read_file",
+                              "arguments": {"path": "a.txt"}}}
+    # Дальше парсер работает как обычно.
+    name, args = HarnessAgent._parse_tool_call(d)
+    assert name == "read_file"
+    assert args == {"path": "a.txt"}
+
+
+def test_tool_call_to_dict_from_object_with_dict_method():
+    """Pydantic v1-стиль: объект с .dict()."""
+
+    class _Function:
+        def __init__(self, name, arguments):
+            self.name = name
+            self.arguments = arguments
+
+        def dict(self):
+            return {"name": self.name, "arguments": self.arguments}
+
+    class _ToolCall:
+        def __init__(self, function):
+            self.function = function
+
+        def dict(self):
+            return {"function": self.function.dict()}
+
+    tc = _ToolCall(_Function("list_dir", {"path": "."}))
+    d = _tool_call_to_dict(tc)
+    assert d == {"function": {"name": "list_dir",
+                              "arguments": {"path": "."}}}
+
+
+def test_tool_call_to_dict_unrecognized_returns_none():
+    """Структура без function → None, вызывающий код логирует warning."""
+    class _Weird:
+        pass
+
+    assert _tool_call_to_dict(_Weird()) is None
+
+
+def test_tool_call_to_dict_rejects_empty_name():
+    """Пустое или нестроковое name — не считается валидным tool_call."""
+    class _Fn:
+        name = ""
+        arguments = {}
+
+    class _TC:
+        function = _Fn()
+
+    assert _tool_call_to_dict(_TC()) is None
 
 
 # --------------------------------------------------------------------------

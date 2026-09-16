@@ -3,6 +3,14 @@
 
 Читает .env (скаляры) и config.yaml (политики и маршруты).
 Конкретных моделей и марок в коде нет — всё приходит из .env.
+
+Приоритет источников: .env выигрывает у унаследованного окружения.
+Если переменная уже была в os.environ с другим значением, файл её
+перезапишет и напечатает warning. Это сделано специально: правка
+.env должна применяться без «магических» условий. Пользователь,
+который хочет переопределить значение на один запуск, может
+отредактировать .env или задать переменную после загрузки
+(например, через отдельный wrapper-скрипт).
 """
 
 from __future__ import annotations
@@ -20,9 +28,16 @@ from harness.fs_guard import FileSystemGuard
 from harness.proxy import ApiProxy
 
 
-BANNER = r"""
+BANNER_TEMPLATE = """
 ============================================================
   Mini Harness — локальный ассистент без контейнеров
+
+  model:        {model}
+  host:         {host}
+  num_ctx:      {num_ctx}
+  num_predict:  {num_predict}
+  keep_alive:   {keep_alive}
+
   /quit  — выход
   /reset — новая сессия (сброс состояния)
 ============================================================
@@ -37,8 +52,14 @@ ENV_PATH = BASE_DIR / ".env"
 def _load_env(path: Path) -> None:
     """Простейший парсер .env: KEY=VALUE, # комментарии, пустые строки.
 
-    Существующие os.environ НЕ перезаписываются — приоритет у реального
-    окружения над файлом. Кавычки вокруг значения снимаются.
+    .env ИМЕЕТ ПРИОРИТЕТ над унаследованным окружением. Если
+    переменная уже была в os.environ с другим значением — печатаем
+    warning и перезаписываем. Это защищает от ситуации «поменял
+    .env, а модель та же»: раньше унаследованное значение молча
+    оставалось, а источник ошибки было не найти.
+
+    Кавычки вокруг значения снимаются. Комментарии после значения
+    не поддерживаются (только целая строка, начинающаяся с #).
     """
     if not path.is_file():
         return
@@ -51,10 +72,16 @@ def _load_env(path: Path) -> None:
             continue
         key = key.strip()
         value = value.strip()
+        if not key:
+            continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        if key and key not in os.environ:
-            os.environ[key] = value
+        inherited = os.environ.get(key)
+        if inherited is not None and inherited != value:
+            print(f"[warn] {key}: .env={value!r} переопределяет "
+                  f"унаследованное окружение {inherited!r}",
+                  file=sys.stderr)
+        os.environ[key] = value
 
 
 def _env_int(name: str, default: int) -> int:
@@ -131,8 +158,18 @@ def load_runtime_config() -> dict:
 
 
 def main() -> None:
-    print(BANNER)
     cfg = load_runtime_config()
+
+    # Баннер печатается ПОСЛЕ загрузки конфига, чтобы показать
+    # фактически применённые значения. Пользователь видит модель
+    # до первого запроса, а не только в [*]-строке от агента.
+    print(BANNER_TEMPLATE.format(
+        model=cfg["model"],
+        host=cfg["ollama_host"],
+        num_ctx=cfg["num_ctx"],
+        num_predict=cfg["num_predict"],
+        keep_alive=cfg["keep_alive"],
+    ))
 
     workspace = (BASE_DIR / cfg["workspace_root"]).resolve()
     workspace.mkdir(parents=True, exist_ok=True)

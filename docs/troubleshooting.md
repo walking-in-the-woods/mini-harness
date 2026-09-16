@@ -4,7 +4,7 @@
 
 **Симптом:** `run.sh` падает с сообщением
 
-```
+```text
 The virtual environment was not created successfully because ensurepip is not
 available.  On Debian/Ubuntu systems, you need to install the python3-venv
 package using the following command.
@@ -100,7 +100,7 @@ curl -sf "${OLLAMA_HOST}/api/tags" | head -c 200
 **Частые причины:**
 
 | Причина | Решение |
-|---|---|
+| --- | --- |
 | Сервер не запущен | Запустить сервис инференса |
 | Модель не загружена | Загрузить модель, имя которой указано в `HARNESS_MODEL` |
 | `HARNESS_MODEL` не совпадает с загруженной | Поправить `.env`, перезапустить REPL |
@@ -151,7 +151,7 @@ glob. Перезапуск не нужен — новый REPL подхвати�
 
 **Решение:** попросить модель переписать в `output/`:
 
-```
+```text
 перепиши резюме в output/summary.md
 ```
 
@@ -162,7 +162,7 @@ glob. Перезапуск не нужен — новый REPL подхвати�
 
 **Решение:** попросить сохранить как `.txt`:
 
-```
+```text
 сохрани этот скрипт как output/script.txt, я запущу вручную
 ```
 
