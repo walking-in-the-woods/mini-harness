@@ -12,7 +12,10 @@
 #   4. Создаёт .env из .env.example, если файла нет.
 #   5. Информационно проверяет, отвечает ли сервер инференса.
 #      Не блокирует запуск.
-#   6. Создаёт дерево workspace/ и logs/.
+#   6. Инициализирует workspace через scripts/setup-workspace.sh:
+#      дерево каталогов, sources.yaml.example, sources.yaml,
+#      prompt-файлы. Идемпотентно: при повторных запусках —
+#      ничего не перезаписывает.
 #   7. Запускает REPL.
 set -euo pipefail
 
@@ -92,8 +95,18 @@ if command -v curl >/dev/null 2>&1; then
     fi
 fi
 
-# ── Дерево workspace/ и logs/ ─────────────────────────────────────────────
-mkdir -p workspace/input workspace/output workspace/notes workspace/drafts logs
+# ── Инициализация workspace ───────────────────────────────────────────────
+# На первом запуске после клона workspace/ пуст — всё содержимое
+# матчится `workspace/*` в .gitignore. setup-workspace.sh создаёт
+# дерево каталогов, sources.yaml.example, sources.yaml и prompt-файлы.
+# Идемпотентен: при повторных запусках ничего не перезаписывает.
+if [[ -f scripts/setup-workspace.sh ]]; then
+    bash scripts/setup-workspace.sh
+else
+    # Fallback для старых клонов, где скрипта ещё нет.
+    mkdir -p workspace/input workspace/output \
+             workspace/notes workspace/drafts logs
+fi
 
 # ── Запуск REPL ───────────────────────────────────────────────────────────
 exec ./.venv/bin/python -m harness.main "$@"

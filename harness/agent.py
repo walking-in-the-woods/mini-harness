@@ -13,24 +13,27 @@ Tool-calling loop.
 
 Guided mode поддерживает два источника system-промпта:
 
-* Встроенный _TRANSFORM_SYSTEM — для задач с ключевым словом
-  (резюме/переведи/объясни/перепиши).
+* Встроенный _TRANSFORM_SYSTEM — для задач с ключевым словом.
 * Пользовательский prompt-файл — если в запросе есть маркер
   («по инструкции из X», «using prompt X») или путь под
-  input/prompts/. Содержимое файла полностью заменяет встроенный
-  system-промпт: два набора инструкций не смешиваются.
+  input/prompts/.
 
-Пользовательский prompt-файл — данные, не код. Его можно менять без
-правки harness, версионировать, тестировать. Для слабых моделей это
-основной способ давать сложные задачи — но без примеров в тексте:
-модели < 4B копируют любой образец из промпта, независимо от того,
-помечен он как «хороший» или «плохой». Подробности —
-docs/prompt-files.md.
+Reasoning-leakage: некоторые модели (qwen3:4b и родственные)
+в режиме guided mode выводят цепочку рассуждений как обычный текст,
+даже при think=False. Смягчается двумя механизмами:
 
-think=False передаётся всегда. tool_calls от ollama >= 0.4 приходят
-как dataclass-объекты, не dict — нормализуем в _tool_call_to_dict.
-Некоторые модели выводят tool calls как JSON в content — fallback
-парсер.
+1. Маркер /no_think добавляется в конец каждого system-промпта.
+   Для qwen3 это активатор «без reasoning» на уровне chat-template.
+   Для остальных моделей — безвредный текст.
+
+2. _looks_like_reasoning + один retry с _RETRY_HEADER. Если и
+   retry дал reasoning — harness отказывается писать результат:
+   возвращает [STOP] без propose_write. Nonce не показывается,
+   пользователь не может случайно подтвердить мусор.
+
+think=False передаётся всегда (для совместимости с ollama-версиями,
+где он работает). tool_calls от ollama >= 0.4 приходят как
+dataclass-объекты, не dict — нормализуем в _tool_call_to_dict.
 """
 
 from __future__ import annotations
@@ -107,8 +110,6 @@ _PATH_RE = re.compile(
     r"|[A-Za-z0-9_-]+\.(?:md|txt|json|py|html|csv|rst|log|yml|yaml)"
 )
 
-# Маркер «путь после этого — prompt-файл». Длинные варианты идут
-# раньше коротких. [:\s]+ — допускаем «из: X», «из X», «using: X».
 _PROMPT_MARKER_RE = re.compile(
     r"(?:"
     r"по\s+инструкции\s+из|"
@@ -127,16 +128,46 @@ _PROMPT_MARKER_RE = re.compile(
     re.I,
 )
 
-# Соглашение проекта: если путь начинается с input/prompts/ —
-# это prompt-файл. Позволяет обойтись без явного маркера в запросе.
 _PROMPT_DIR_PREFIX = "input/prompts/"
 
-# Порог «плохого резюме». 30 — граница между «Тест» (4),
-# «Тестовый документ» (17) и осмысленной фразой из 5-6 слов.
 _MIN_SUMMARY_CHARS = 30
 
-# Мягкое предупреждение, если prompt-файл большой. Не отказ.
 _PROMPT_SIZE_WARN = 8000
+
+# Активатор «без reasoning» для qwen3. Распознаётся chat-template модели
+# на уровне special token; для остальных моделей — безвредный текст.
+# Ставится в конец system-промпта. Если после этого модель всё равно
+# рассуждает — это её предел, никакой промпт не поможет.
+_NO_THINK = "\n\n/no_think"
+
+_REASONING_MARKERS = re.compile(
+    r"(?:"
+    r"мне\s+нужно|"
+    r"нужно\s+проверить|"
+    r"нужно\s+посмотреть|"
+    r"сначала\s+определю|"
+    r"сначала\s+нужно|"
+    r"теперь\s+нужно|"
+    r"теперь\s+составлю|"
+    r"теперь\s+опишу|"
+    r"проверю|"
+    r"возможно,|"
+    r"наверное,|"
+    r"хорошо,|"
+    r"итак,|"
+    r"первый\s+шаг|"
+    r"второй\s+шаг|"
+    r"шаг\s+\d|"
+    r"let\s+me|"
+    r"i\s+need\s+to|"
+    r"i'll\s+|"
+    r"first,?\s+i|"
+    r"okay,|"
+    r"ok,|"
+    r"so,?\s+i"
+    r")",
+    re.I,
+)
 
 _TRANSFORM_SYSTEM = """\
 You are a text transformation tool. You receive an instruction and a
@@ -169,6 +200,17 @@ REQUIREMENTS:
 - Output ONLY the summary text. No headings, no lists, no code fences.
 
 Write the summary now.
+"""
+
+_RETRY_HEADER = """\
+ПРЕДЫДУЩАЯ ПОПЫТКА ПРОВАЛИЛАСЬ: вместо готового текста ты вывел(а)
+рассуждения, план или вопросы к себе. В этот раз выведи ТОЛЬКО
+готовый результат. Никаких вводных фраз вроде «Хорошо, мне нужно…»,
+«Сначала определю…», «Теперь нужно…». Не рассуждай, не проверяй
+себя, не задавай вопросов. Начни сразу с первого предложения ответа.
+
+---
+
 """
 
 
@@ -293,7 +335,7 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _looks_like_bad_summary(text: str, source: str) -> str | None:
-    """Причина «плохого» результата, или None если всё ок."""
+    """Причина «плохого» результата для summarize, или None если ок."""
     if not text or not text.strip():
         return "пустой ответ"
     stripped = text.strip()
@@ -301,6 +343,32 @@ def _looks_like_bad_summary(text: str, source: str) -> str | None:
         return f"слишком коротко ({len(stripped)} chars)"
     if stripped in source:
         return "результат является подстрокой исходника (копия)"
+    return None
+
+
+def _looks_like_reasoning(text: str) -> str | None:
+    """Причина, если текст похож на reasoning, иначе None.
+
+    Признаки:
+    * Первая строка начинается с мета-маркера.
+    * Текст содержит ≥3 мета-маркеров.
+    * Длина текста > 3000 символов при отсутствии видимых абзацев
+      ответа — почти всегда признак незавершённого reasoning.
+    """
+    if not text or not text.strip():
+        return None
+
+    first_line = text.strip().split("\n", 1)[0]
+    if _REASONING_MARKERS.search(first_line):
+        return f"первая строка — мета: {first_line[:60]!r}"
+
+    matches = _REASONING_MARKERS.findall(text)
+    if len(matches) >= 3:
+        return f"маркеры reasoning: {len(matches)}"
+
+    if len(text) > 3000:
+        return f"подозрительно длинный ответ: {len(text)} chars"
+
     return None
 
 
@@ -359,8 +427,7 @@ def _try_parse_json(chunk: str) -> Any:
 
 
 def _extract_tool_calls_from_content(content: str) -> list[dict]:
-    """Извлечь tool calls из текстового content (fallback для
-    qwen2.5-coder:3b и родственных)."""
+    """Извлечь tool calls из текстового content (fallback)."""
     if not content or "{" not in content:
         return []
 
@@ -417,17 +484,7 @@ def _extract_tool_calls_from_content(content: str) -> list[dict]:
 
 
 def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
-    """Разобрать запрос как план guided mode.
-
-    Возвращает dict:
-      operation    — "summarize" / "translate" / "explain" / "rewrite"
-                     / "custom" (когда есть prompt-файл без ключевого
-                     слова в самом запросе)
-      source       — путь к данным
-      target       — путь для записи результата или None
-      prompt_path  — путь к prompt-файлу или None
-    """
-    # 1. Маркер
+    """Разобрать запрос как план guided mode."""
     prompt_path = None
     marker_match = _PROMPT_MARKER_RE.search(prompt)
     if marker_match:
@@ -436,7 +493,6 @@ def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
         if rp is not None and rp.is_file():
             prompt_path = candidate
 
-    # 2. Соглашение input/prompts/
     if prompt_path is None:
         seen_conv: set[str] = set()
         for m in _PATH_RE.finditer(prompt):
@@ -450,8 +506,6 @@ def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
                     prompt_path = p
                     break
 
-    # operation: ключевое слово из запроса. Если его нет, но есть
-    # prompt-файл — операция "custom": файл сам расскажет, что делать.
     operation = None
     for op, pattern in _TASK_KEYWORDS:
         if pattern.search(prompt):
@@ -471,8 +525,6 @@ def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
             seen.add(p)
             paths.append(p)
 
-    # prompt-файл не должен попасть в роли source или target.
-    # Сравниваем по нормализованной форме: ‘./input/…’ == ‘input/…’.
     if prompt_path is not None:
         prompt_norm = prompt_path.removeprefix("./")
         paths = [p for p in paths
@@ -591,7 +643,6 @@ class HarnessAgent:
                              source=plan["source"], error=err)
             return {"text": err, "pending_writes": []}
 
-        # Обрезаем источник, если он не влезает в контекст модели.
         max_chars = self.num_ctx * 3
         if len(content) > max_chars:
             print(f"[!] источник {len(content)} символов, обрезаю до "
@@ -600,8 +651,6 @@ class HarnessAgent:
                   file=sys.stderr, flush=True)
             content = content[:max_chars] + "\n[... truncated ...]"
 
-        # Пользовательский prompt-файл — если есть, его содержимое
-        # заменит _TRANSFORM_SYSTEM в слоте system.
         custom_prompt = None
         if plan.get("prompt_path"):
             cp, perr = self._read_file_raw(plan["prompt_path"])
@@ -624,21 +673,76 @@ class HarnessAgent:
             custom_prompt=custom_prompt,
         )
 
-        # Проверка качества для summarize: слишком коротко или копия.
-        # Один повтор с более жёстким промптом. С кастомным prompt
-        # retry не делаем — мы не знаем ожидаемого формата.
-        if plan["operation"] == "summarize" and custom_prompt is None:
-            reason = _looks_like_bad_summary(transformed or "", content)
+        # Retry-логика:
+        # 1. Reasoning-leakage — работает и для custom prompt.
+        # 2. Если после retry снова reasoning — жёсткий отказ без
+        #    propose_write. Пользователь не может подтвердить мусор.
+        # 3. Для встроенного summarize — короткий ответ или копия.
+
+        reasoning_reason = None
+        if transformed is not None:
+            reasoning_reason = _looks_like_reasoning(transformed)
+
+        if reasoning_reason:
+            print(f"[!] ответ похож на reasoning: {reasoning_reason}; "
+                  f"повтор с усиленным промптом",
+                  file=sys.stderr, flush=True)
+            self.audit.write("guided_retry",
+                             operation=plan["operation"],
+                             reason=f"reasoning: {reasoning_reason}",
+                             attempt=1)
+
+            if custom_prompt is not None:
+                retry_prompt = _RETRY_HEADER + custom_prompt
+            else:
+                retry_prompt = None
+
+            retried = self._transform_text(
+                user_prompt, plan["source"], content,
+                retry=(retry_prompt is None),
+                custom_prompt=retry_prompt,
+            )
+
+            if retried is not None:
+                second_reason = _looks_like_reasoning(retried)
+                if second_reason:
+                    print(f"[!] retry тоже дал reasoning: {second_reason}. "
+                          f"Файл не записан. Модель не справляется с "
+                          f"guided mode — попробуйте другую модель.",
+                          file=sys.stderr, flush=True)
+                    self.audit.write("guided_reasoning_unrecoverable",
+                                     operation=plan["operation"],
+                                     attempt=2,
+                                     reason=second_reason)
+                    return {
+                        "text": (
+                            "[STOP] Модель не смогла выдать результат "
+                            "без рассуждений — дважды подряд. Это "
+                            "ограничение модели, а не harness.\n"
+                            "Варианты: сменить модель в .env (например, "
+                            "на qwen2.5:7b-instruct или llama3.2:3b) "
+                            "или использовать задачу, где модель сильнее."
+                        ),
+                        "pending_writes": [],
+                    }
+                transformed = retried
+
+        if (transformed is not None
+                and plan["operation"] == "summarize"
+                and custom_prompt is None
+                and not reasoning_reason):
+            reason = _looks_like_bad_summary(transformed, content)
             if reason:
                 print(f"[!] результат не похож на резюме: {reason}; "
                       f"повтор с уточнением", file=sys.stderr, flush=True)
                 self.audit.write("guided_retry",
                                  operation=plan["operation"],
-                                 reason=reason)
+                                 reason=reason,
+                                 attempt=1)
                 retried = self._transform_text(
                     user_prompt, plan["source"], content, retry=True,
                 )
-                if retried:
+                if retried is not None:
                     transformed = retried
 
         if transformed is None:
@@ -671,14 +775,11 @@ class HarnessAgent:
                         source_content: str,
                         *, retry: bool = False,
                         custom_prompt: str | None = None) -> str | None:
-        """Один вызов модели БЕЗ tools. Только переписывание текста.
+        """Один вызов модели БЕЗ tools.
 
-        custom_prompt — содержимое prompt-файла, если пользователь
-        его задал. В этом случае оно полностью заменяет встроенный
-        system-промпт, а user message содержит только source и
-        нейтральную фразу «примени инструкцию». Формулировки вида
-        «output the result» маленькие модели понимают буквально и
-        добавляют префикс «Результат:» в начало ответа.
+        В конец system-промпта добавляется маркер /no_think — для
+        qwen3 это активатор режима без reasoning на уровне
+        chat-template. Для остальных моделей — безвредный текст.
         """
         if custom_prompt is not None:
             system = custom_prompt
@@ -697,6 +798,8 @@ class HarnessAgent:
                 f"Now output the result."
             )
             tag_prefix = "retry" if retry else "first"
+
+        system = system + _NO_THINK
 
         try:
             resp = self.client.chat(
