@@ -1,0 +1,50 @@
+# Политики файловой системы и маршруты внешних API.
+# Скалярные настройки (модель, хост, лимиты) — в .env.
+
+fs:
+  # Белый список. Файл должен матчиться ХОТЯ БЫ ОДНИМ шаблоном.
+  # Пустой список = «ничего не разрешено». Отсутствие ключа → ["**"].
+  whitelist:
+    - "**"
+
+  # Чёрный список. Применяется ПОСЛЕ белого.
+  blacklist:
+    - "**/.git/**"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/*.key"
+    - "**/*.pem"
+    - "**/.ssh/**"
+    - "**/.aws/**"
+    - "**/.kube/**"
+    - "**/id_rsa*"
+    - "**/id_ed25519*"
+    - "**/.bashrc"
+    - "**/.zshrc"
+    - "**/.profile"
+    - "**/.netrc"
+    - "**/.npmrc"
+    - "**/.pypirc"
+    - "**/Makefile"
+    - "**/Dockerfile*"
+    - "**/docker-compose*"
+    - "**/package.json"
+    - "**/setup.py"
+    - "**/pyproject.toml"
+    - "**/.github/workflows/**"
+
+  # Пути, РАЗРЕШЁННЫЕ ДЛЯ ЗАПИСИ. Пустой список = запись везде запрещена.
+  writable:
+    - "output/**"
+    - "notes/**"
+    - "drafts/**"
+    - "*.md"
+    - "*.txt"
+
+proxy:
+  # Хост берётся ЗДЕСЬ, не из аргументов модели. Это закрывает SSRF.
+  routes:
+    weather:   "https://api.open-meteo.com/v1/forecast"
+    translate: "https://api.mymemory.translated.net/get"
+    fake-data: "https://jsonplaceholder.typicode.com/posts"
+    countries: "https://restcountries.com/v3.1/all"
