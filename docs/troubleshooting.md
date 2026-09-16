@@ -1,5 +1,85 @@
 # Диагностика
 
+## `ensurepip is not available`
+
+**Симптом:** `run.sh` падает с сообщением
+
+```
+The virtual environment was not created successfully because ensurepip is not
+available.  On Debian/Ubuntu systems, you need to install the python3-venv
+package using the following command.
+```
+
+**Причина:** на Debian/Ubuntu пакет `python3-venv` не входит в базовую
+поставку Python. Без него `python -m venv` создаёт директорию, но не
+может развернуть в ней `pip` — модуль `ensurepip` отсутствует.
+
+**Решение:**
+
+```bash
+# Установить пакет под минорную версию текущего Python
+sudo apt install -y python3.12-venv
+rm -rf .venv
+./run.sh
+```
+
+Если `python3.12-venv` недоступен, посмотрите список:
+
+```bash
+apt-cache search python3-venv
+```
+
+Точное имя пакета подставляется по версии:
+
+```bash
+sudo apt install -y "python$(python3 -c \
+  'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv"
+```
+
+**Важно:** `.venv` после неудачной попытки нужно удалить вручную —
+частично созданная директория без `pip` мешает пересозданию. Свежая
+версия `run.sh` делает это автоматически (проверяет импорт
+зависимостей, а не факт существования `.venv`).
+
+## `run.sh` не запускается от root
+
+**Симптом:** `run.sh` выходит с сообщением
+«run.sh не должен запускаться от root».
+
+**Причина:** под root созданные файлы получат владельца `root:root`,
+а `.venv` станет недоступен вашему пользователю. `mini-harness` не
+требует привилегий — только системные пакеты ставятся через `sudo`,
+отдельно от `run.sh`.
+
+**Решение:**
+
+```bash
+# Запустить от своего пользователя
+./run.sh
+
+# Если уже что-то создано от root — вернуть владельца
+sudo chown -R "$USER:$USER" .venv workspace logs
+```
+
+## `ModuleNotFoundError: No module named 'yaml'`
+
+**Симптом:** `python -m harness.main` падает на первом импорте.
+
+**Причина:** `.venv` существует, но пуст — установка зависимостей
+была прервана или не выполнялась. `run.sh` старой версии проверял
+только факт наличия директории.
+
+**Решение:**
+
+```bash
+rm -rf .venv
+./run.sh
+```
+
+Свежая версия `run.sh` проверяет, что все три зависимости
+(`yaml`, `ollama`, `httpx`) действительно импортируются, и
+пересоздаёт venv, если нет.
+
 ## Модель не отвечает
 
 **Симптом:** `[ollama error] ...` или пустой ответ.
@@ -118,6 +198,20 @@ Unicode-символы, гомоглифы.
 (но осторожно — маленькие модели начинают выдумывать после 3–4
 раундов).
 
+## `ERROR: upstream request failed`
+
+**Что произошло:** `api_call` не смог достучаться до внешнего API.
+
+**Проверьте:**
+
+```bash
+# Доступен ли хост из браузера/curl
+curl -sS "https://api.open-meteo.com/v1/forecast?latitude=55.75&longitude=37.62&current=temperature_2m" | head
+```
+
+Если curl тоже не работает — проблема на стороне сервиса. Маршруты
+перечислены в `config.yaml:proxy.routes`.
+
 ## Медленно / OOM
 
 **Симптом:** система уходит в swap, процесс убит OOM-killer'ом.
@@ -129,6 +223,23 @@ Unicode-символы, гомоглифы.
 2. Уменьшить `HARNESS_KEEP_ALIVE` (`5m` → `30s`).
 3. Уменьшить `HARNESS_NUM_PREDICT`.
 4. Взять модель меньшего размера.
+
+## `Permission denied` при записи в `workspace/`
+
+**Что произошло:** файлы в `workspace/` принадлежат другому
+пользователю (например, `root`, если проект разворачивался через
+`sudo`).
+
+**Решение:**
+
+```bash
+sudo chown -R "$USER:$USER" workspace logs
+ls -ld workspace
+# владелец должен быть вы
+```
+
+Проверить, что `run.sh` больше не запускается от root — в свежей
+версии есть проверка `EUID`.
 
 ## Куда смотреть в первую очередь
 
