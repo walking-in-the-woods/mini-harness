@@ -9,16 +9,28 @@ Tool-calling loop.
   цепочку из нескольких tool calls.
 
 * Autonomous mode — модель сама вызывает инструменты через tool
-  calling. Работает на моделях от 7B и выше. Fallback, если guided
-  mode не распознал в запросе паттерн.
+  calling. Fallback, если guided mode не распознал в запросе паттерн.
 
-Guided mode защищён от слабых ответов: если результат для задачи
-summarize короче _MIN_SUMMARY_CHARS или является подстрокой исходника,
-делается один повторный запрос с более жёстким system-промптом.
+Guided mode поддерживает два источника system-промпта:
+
+* Встроенный _TRANSFORM_SYSTEM — для задач с ключевым словом
+  (резюме/переведи/объясни/перепиши).
+* Пользовательский prompt-файл — если в запросе есть маркер
+  («по инструкции из X», «using prompt X») или путь под
+  input/prompts/. Содержимое файла полностью заменяет встроенный
+  system-промпт: два набора инструкций не смешиваются.
+
+Пользовательский prompt-файл — данные, не код. Его можно менять без
+правки harness, версионировать, тестировать. Для слабых моделей это
+основной способ давать сложные задачи — но без примеров в тексте:
+модели < 4B копируют любой образец из промпта, независимо от того,
+помечен он как «хороший» или «плохой». Подробности —
+docs/prompt-files.md.
 
 think=False передаётся всегда. tool_calls от ollama >= 0.4 приходят
-как dataclass-объекты, не dict. Некоторые модели выводят tool calls
-как JSON в content — fallback парсер.
+как dataclass-объекты, не dict — нормализуем в _tool_call_to_dict.
+Некоторые модели выводят tool calls как JSON в content — fallback
+парсер.
 """
 
 from __future__ import annotations
@@ -95,12 +107,36 @@ _PATH_RE = re.compile(
     r"|[A-Za-z0-9_-]+\.(?:md|txt|json|py|html|csv|rst|log|yml|yaml)"
 )
 
-# Порог «плохого резюме». Если результат короче — вероятно, модель
-# вывела заголовок или одно слово. 30 — граница между «Тест» (4),
+# Маркер «путь после этого — prompt-файл». Длинные варианты идут
+# раньше коротких. [:\s]+ — допускаем «из: X», «из X», «using: X».
+_PROMPT_MARKER_RE = re.compile(
+    r"(?:"
+    r"по\s+инструкции\s+из|"
+    r"по\s+инструкции|"
+    r"согласно\s+инструкции\s+из|"
+    r"согласно\s+инструкции|"
+    r"с\s+промптом|"
+    r"по\s+промпту|"
+    r"using\s+prompt|"
+    r"with\s+prompt|"
+    r"following\s+prompt|"
+    r"per\s+prompt"
+    r")"
+    r"[:\s]+"
+    r"([A-Za-z0-9_./-]+\.(?:md|txt|markdown))",
+    re.I,
+)
+
+# Соглашение проекта: если путь начинается с input/prompts/ —
+# это prompt-файл. Позволяет обойтись без явного маркера в запросе.
+_PROMPT_DIR_PREFIX = "input/prompts/"
+
+# Порог «плохого резюме». 30 — граница между «Тест» (4),
 # «Тестовый документ» (17) и осмысленной фразой из 5-6 слов.
-# Порог намеренно низкий: короткий источник может дать короткое
-# резюме, и retry на нём — ложное срабатывание.
 _MIN_SUMMARY_CHARS = 30
+
+# Мягкое предупреждение, если prompt-файл большой. Не отказ.
+_PROMPT_SIZE_WARN = 8000
 
 _TRANSFORM_SYSTEM = """\
 You are a text transformation tool. You receive an instruction and a
@@ -109,25 +145,15 @@ source text. Follow the instruction exactly.
 CRITICAL RULES:
 - Output ONLY the transformed text. No preamble, no explanations, no
   headings, no bullet lists, no code fences.
-- If the task is to summarize, retell, or describe: write 2-4 complete
-  sentences in your OWN WORDS. Explain what the text is ABOUT — its
-  topic, main ideas, key points.
+- For summarize/retell tasks: write 2-4 complete sentences in your
+  OWN WORDS. Explain what the text is ABOUT — its topic, main ideas,
+  key points.
 - Do NOT copy the title, first line, first sentence, or any verbatim
   fragment of the source.
-- Do NOT list keywords. Do NOT repeat the source.
+- Do NOT list keywords. Do NOT repeat the source structure.
+- Write in the SAME LANGUAGE as the source text.
 
-WHAT NOT TO OUTPUT for a summarize task (examples of failure):
-  ✗  "# Тест"                         (the title, not a summary)
-  ✗  "Тест"                            (a single word)
-  ✗  "Тестовый документ..."            (the first line)
-  ✗  The source text itself
-
-WHAT TO OUTPUT (success):
-  ✓  "Документ описывает тестовую структуру с двумя заголовками и
-      примерами форматирования. Автор показывает разметку markdown."
-
-Write in the SAME LANGUAGE as the source text. Output the transformed
-text now, nothing else.
+Output the transformed text now, nothing else.
 """
 
 _TRANSFORM_SYSTEM_RETRY = """\
@@ -267,24 +293,19 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _looks_like_bad_summary(text: str, source: str) -> str | None:
-    """Причина «плохого» результата, или None если всё ок.
-
-    Срабатывает для операции summarize. Возвращает строку-причину
-    для диагностики в stderr.
-    """
+    """Причина «плохого» результата, или None если всё ок."""
     if not text or not text.strip():
         return "пустой ответ"
     stripped = text.strip()
     if len(stripped) < _MIN_SUMMARY_CHARS:
         return f"слишком коротко ({len(stripped)} chars)"
-    # Verbatim copy: результат — подстрока исходника.
-    # Для легитимного резюме это почти невозможно (перефразирование).
     if stripped in source:
         return "результат является подстрокой исходника (копия)"
     return None
 
 
 def _tool_call_to_dict(tc: Any) -> dict | None:
+    """Нормализовать tool_call в plain dict (см. _parse_tool_call)."""
     if isinstance(tc, dict):
         return tc
 
@@ -398,14 +419,47 @@ def _extract_tool_calls_from_content(content: str) -> list[dict]:
 def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
     """Разобрать запрос как план guided mode.
 
-    Возвращает {"operation": str, "source": str, "target": str|None}
-    или None, если в запросе нет подходящего паттерна.
+    Возвращает dict:
+      operation    — "summarize" / "translate" / "explain" / "rewrite"
+                     / "custom" (когда есть prompt-файл без ключевого
+                     слова в самом запросе)
+      source       — путь к данным
+      target       — путь для записи результата или None
+      prompt_path  — путь к prompt-файлу или None
     """
+    # 1. Маркер
+    prompt_path = None
+    marker_match = _PROMPT_MARKER_RE.search(prompt)
+    if marker_match:
+        candidate = marker_match.group(1)
+        rp, _ = fs_guard.resolve_read(candidate)
+        if rp is not None and rp.is_file():
+            prompt_path = candidate
+
+    # 2. Соглашение input/prompts/
+    if prompt_path is None:
+        seen_conv: set[str] = set()
+        for m in _PATH_RE.finditer(prompt):
+            p = m.group(0)
+            if p in seen_conv:
+                continue
+            seen_conv.add(p)
+            if p.removeprefix("./").startswith(_PROMPT_DIR_PREFIX):
+                rp, _ = fs_guard.resolve_read(p)
+                if rp is not None and rp.is_file():
+                    prompt_path = p
+                    break
+
+    # operation: ключевое слово из запроса. Если его нет, но есть
+    # prompt-файл — операция "custom": файл сам расскажет, что делать.
     operation = None
     for op, pattern in _TASK_KEYWORDS:
         if pattern.search(prompt):
             operation = op
             break
+    if operation is None and prompt_path is not None:
+        operation = "custom"
+
     if operation is None:
         return None
 
@@ -416,6 +470,13 @@ def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
         if p not in seen:
             seen.add(p)
             paths.append(p)
+
+    # prompt-файл не должен попасть в роли source или target.
+    # Сравниваем по нормализованной форме: ‘./input/…’ == ‘input/…’.
+    if prompt_path is not None:
+        prompt_norm = prompt_path.removeprefix("./")
+        paths = [p for p in paths
+                 if p.removeprefix("./") != prompt_norm]
 
     if not paths:
         return None
@@ -437,7 +498,12 @@ def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
 
     if source is None:
         return None
-    return {"operation": operation, "source": source, "target": target}
+    return {
+        "operation": operation,
+        "source": source,
+        "target": target,
+        "prompt_path": prompt_path,
+    }
 
 
 class HarnessAgent:
@@ -513,8 +579,10 @@ class HarnessAgent:
             return None
 
         target_label = plan["target"] or "(display only)"
+        prompt_label = plan["prompt_path"] or "built-in"
         print(f"[*] guided mode: {plan['operation']} "
-              f"{plan['source']} -> {target_label}",
+              f"{plan['source']} -> {target_label} "
+              f"[prompt: {prompt_label}]",
               file=sys.stderr, flush=True)
 
         content, err = self._read_file_raw(plan["source"])
@@ -532,13 +600,34 @@ class HarnessAgent:
                   file=sys.stderr, flush=True)
             content = content[:max_chars] + "\n[... truncated ...]"
 
+        # Пользовательский prompt-файл — если есть, его содержимое
+        # заменит _TRANSFORM_SYSTEM в слоте system.
+        custom_prompt = None
+        if plan.get("prompt_path"):
+            cp, perr = self._read_file_raw(plan["prompt_path"])
+            if perr:
+                print(f"[!] не удалось прочитать prompt-файл "
+                      f"{plan['prompt_path']}: {perr}",
+                      file=sys.stderr, flush=True)
+                self.audit.write("guided_prompt_read_error",
+                                 path=plan["prompt_path"], error=perr)
+            else:
+                if len(cp) > _PROMPT_SIZE_WARN:
+                    print(f"[!] prompt-файл {len(cp)} символов — "
+                          f"может не влезть в контекст "
+                          f"(NUM_CTX={self.num_ctx})",
+                          file=sys.stderr, flush=True)
+                custom_prompt = cp
+
         transformed = self._transform_text(
             user_prompt, plan["source"], content,
+            custom_prompt=custom_prompt,
         )
 
         # Проверка качества для summarize: слишком коротко или копия.
-        # Один повтор с более жёстким промптом.
-        if plan["operation"] == "summarize":
+        # Один повтор с более жёстким промптом. С кастомным prompt
+        # retry не делаем — мы не знаем ожидаемого формата.
+        if plan["operation"] == "summarize" and custom_prompt is None:
             reason = _looks_like_bad_summary(transformed or "", content)
             if reason:
                 print(f"[!] результат не похож на резюме: {reason}; "
@@ -571,6 +660,7 @@ class HarnessAgent:
                          operation=plan["operation"],
                          source=plan["source"],
                          target=plan["target"],
+                         prompt_path=plan.get("prompt_path"),
                          output_bytes=len(transformed.encode("utf-8")))
         return {
             "text": transformed,
@@ -579,15 +669,35 @@ class HarnessAgent:
 
     def _transform_text(self, instruction: str, source_path: str,
                         source_content: str,
-                        *, retry: bool = False) -> str | None:
-        """Один вызов модели БЕЗ tools. Только переписывание текста."""
-        system = _TRANSFORM_SYSTEM_RETRY if retry else _TRANSFORM_SYSTEM
-        user_msg = (
-            f"Instruction:\n{instruction}\n\n"
-            f"Source text (from {source_path}):\n"
-            f"---BEGIN---\n{source_content}\n---END---\n\n"
-            f"Now output the result."
-        )
+                        *, retry: bool = False,
+                        custom_prompt: str | None = None) -> str | None:
+        """Один вызов модели БЕЗ tools. Только переписывание текста.
+
+        custom_prompt — содержимое prompt-файла, если пользователь
+        его задал. В этом случае оно полностью заменяет встроенный
+        system-промпт, а user message содержит только source и
+        нейтральную фразу «примени инструкцию». Формулировки вида
+        «output the result» маленькие модели понимают буквально и
+        добавляют префикс «Результат:» в начало ответа.
+        """
+        if custom_prompt is not None:
+            system = custom_prompt
+            user_msg = (
+                f"Источник ({source_path}):\n"
+                f"---BEGIN---\n{source_content}\n---END---\n\n"
+                f"Примени инструкцию из системного сообщения."
+            )
+            tag_prefix = "custom"
+        else:
+            system = _TRANSFORM_SYSTEM_RETRY if retry else _TRANSFORM_SYSTEM
+            user_msg = (
+                f"Instruction:\n{instruction}\n\n"
+                f"Source text (from {source_path}):\n"
+                f"---BEGIN---\n{source_content}\n---END---\n\n"
+                f"Now output the result."
+            )
+            tag_prefix = "retry" if retry else "first"
+
         try:
             resp = self.client.chat(
                 model=self.model,
@@ -611,11 +721,9 @@ class HarnessAgent:
         text = (msg.get("content") or "").strip()
         text = _strip_code_fence(text)
 
-        # Диагностика: показать, что вернула модель. Полезно при
-        # отладке — иначе видно только итог после _tool_propose_write.
         preview = text.replace("\n", " ")[:120]
-        tag = "retry" if retry else "first"
-        print(f"[*] {tag} model output: {preview!r} ({len(text)} chars)",
+        print(f"[*] {tag_prefix} model output: {preview!r} "
+              f"({len(text)} chars)",
               file=sys.stderr, flush=True)
 
         return text or None

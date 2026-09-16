@@ -6,11 +6,15 @@
 
 Приоритет источников: .env выигрывает у унаследованного окружения.
 Если переменная уже была в os.environ с другим значением, файл её
-перезапишет и напечатает warning. Это сделано специально: правка
-.env должна применяться без «магических» условий. Пользователь,
-который хочет переопределить значение на один запуск, может
-отредактировать .env или задать переменную после загрузки
-(например, через отдельный wrapper-скрипт).
+перезапишет и напечатает warning. Это защищает от ситуации «поменял
+.env, а модель та же».
+
+Команды пользователя (не модели):
+  /sources                     список источников
+  /tree <name> [subpath]       дерево -> input/_tree_<name>.md
+  /files <name> [subpath]      плоский список -> input/_files_<name>.md
+  /dump <name> [subpath]       содержимое -> input/_dump_<name>.md
+  /reload                      перечитать sources.yaml
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from harness.audit import AuditLog
 from harness.confirm import ConfirmSession
 from harness.fs_guard import FileSystemGuard
 from harness.proxy import ApiProxy
+from harness.sources import SourceError, SourceRegistry
 
 
 BANNER_TEMPLATE = """
@@ -37,9 +42,11 @@ BANNER_TEMPLATE = """
   num_ctx:      {num_ctx}
   num_predict:  {num_predict}
   keep_alive:   {keep_alive}
+  sources:      {sources}
 
   /quit  — выход
   /reset — новая сессия (сброс состояния)
+  /sources, /tree, /files, /dump, /reload — внешние источники
 ============================================================
 """
 
@@ -50,16 +57,10 @@ ENV_PATH = BASE_DIR / ".env"
 
 
 def _load_env(path: Path) -> None:
-    """Простейший парсер .env: KEY=VALUE, # комментарии, пустые строки.
+    """Простейший парсер .env: KEY=VALUE, # комментарии.
 
-    .env ИМЕЕТ ПРИОРИТЕТ над унаследованным окружением. Если
-    переменная уже была в os.environ с другим значением — печатаем
-    warning и перезаписываем. Это защищает от ситуации «поменял
-    .env, а модель та же»: раньше унаследованное значение молча
-    оставалось, а источник ошибки было не найти.
-
-    Кавычки вокруг значения снимаются. Комментарии после значения
-    не поддерживаются (только целая строка, начинающаяся с #).
+    .env ИМЕЕТ ПРИОРИТЕТ над унаследованным окружением. При
+    конфликте печатает warning и перезаписывает.
     """
     if not path.is_file():
         return
@@ -157,22 +158,135 @@ def load_runtime_config() -> dict:
     }
 
 
+# ── Команды внешних источников ────────────────────────────────────────────
+
+def _print_sources(registry: SourceRegistry,
+                   workspace: Path) -> None:
+    sources = registry.list()
+    if not sources:
+        print(f"[i] Источников нет. Создайте {workspace / 'sources.yaml'}")
+        print(f"    (шаблон: {workspace / 'sources.yaml.example'})")
+        return
+    for s in sources:
+        state = "ok" if s.exists else "недоступен"
+        print(f"  {s.name:20} {state:12} {s.root}")
+        if s.description:
+            print(f"  {'':20} {s.description}")
+
+
+def _write_to_input(workspace: Path, filename: str, body: str) -> Path:
+    """Записать сгенерированный отчёт в workspace/input/.
+
+    Пишем напрямую, минуя FileSystemGuard. Эти команды — привилегия
+    пользователя, не модели. Guard применяется к тому, что предлагает
+    модель через propose_write.
+    """
+    input_dir = workspace / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    target = input_dir / filename
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
+def _handle_source_command(user_input: str, registry: SourceRegistry,
+                            workspace: Path) -> bool:
+    """Обрабатывает /sources, /tree, /files, /dump, /reload.
+
+    Возвращает True, если команда была обработана. False — если это
+    не команда источников (пусть обрабатывается дальше).
+    """
+    if user_input == "/sources":
+        _print_sources(registry, workspace)
+        return True
+
+    if user_input == "/reload":
+        try:
+            registry.reload()
+            print(f"[+] sources.yaml перечитан "
+                  f"({len(registry.list())} источников)")
+        except SourceError as e:
+            print(f"[!] {e}")
+        return True
+
+    for prefix, action in (
+        ("/tree ", "tree"),
+        ("/files ", "files"),
+        ("/dump ", "dump"),
+    ):
+        if not user_input.startswith(prefix):
+            continue
+        rest = user_input[len(prefix):].strip()
+        parts = rest.split(maxsplit=1)
+        if not parts:
+            print(f"[!] usage: {prefix}<source> [subpath]")
+            return True
+        name = parts[0]
+        subpath = parts[1] if len(parts) > 1 else ""
+
+        try:
+            if action == "tree":
+                body, count = registry.build_tree(name, subpath)
+                fname = f"_tree_{name}.md"
+                header = f"# Tree: {name}"
+                if subpath:
+                    header += f"/{subpath}"
+                report = f"{header}\n\n{body}\n"
+                _write_to_input(workspace, fname, report)
+                print(f"[+] {fname}  ({count} entries)")
+            elif action == "files":
+                body, count = registry.build_file_list(name, subpath)
+                fname = f"_files_{name}.md"
+                header = f"# Files: {name}"
+                if subpath:
+                    header += f"/{subpath}"
+                report = f"{header}\n\n```\n{body}\n```\n"
+                _write_to_input(workspace, fname, report)
+                print(f"[+] {fname}  ({count} files)")
+            else:  # dump
+                body, stats = registry.collect_dump(name, subpath)
+                fname = f"_dump_{name}.md"
+                _write_to_input(workspace, fname, body)
+                print(f"[+] {fname}  "
+                      f"({stats['files_included']} files, "
+                      f"{stats['bytes_total']} bytes)")
+                if stats["truncated"]:
+                    print("[i] отчёт обрезан — увеличьте лимиты "
+                          "в workspace/sources.yaml")
+        except SourceError as e:
+            print(f"[!] {e}")
+        return True
+
+    return False
+
+
+# ── main ──────────────────────────────────────────────────────────────────
+
 def main() -> None:
     cfg = load_runtime_config()
 
-    # Баннер печатается ПОСЛЕ загрузки конфига, чтобы показать
-    # фактически применённые значения. Пользователь видит модель
-    # до первого запроса, а не только в [*]-строке от агента.
+    workspace = (BASE_DIR / cfg["workspace_root"]).resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Реестр источников — ДО баннера, чтобы отобразить их количество.
+    try:
+        registry = SourceRegistry(
+            workspace_dir=workspace,
+            global_blacklist=tuple(
+                cfg["fs"].get("blacklist") or []
+            ),
+        )
+    except SourceError as e:
+        print(f"[fatal] sources.yaml: {e}", file=sys.stderr)
+        sys.exit(1)
+
     print(BANNER_TEMPLATE.format(
         model=cfg["model"],
         host=cfg["ollama_host"],
         num_ctx=cfg["num_ctx"],
         num_predict=cfg["num_predict"],
         keep_alive=cfg["keep_alive"],
+        sources=len(registry.list()),
     ))
-
-    workspace = (BASE_DIR / cfg["workspace_root"]).resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
 
     fs_policy = {
         "root": str(workspace),
@@ -213,6 +327,11 @@ def main() -> None:
         if user_input == "/reset":
             agent = HarnessAgent(cfg, guard, proxy, audit)
             print("[session reset]")
+            continue
+
+        # Команды источников — до agent.run(), чтобы они не уходили
+        # в модель как обычный текст.
+        if _handle_source_command(user_input, registry, workspace):
             continue
 
         try:

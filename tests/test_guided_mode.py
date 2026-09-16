@@ -74,6 +74,14 @@ def _make_agent(guard: FileSystemGuard, workspace: Path,
     return HarnessAgent(cfg, guard, proxy, audit, client=client)
 
 
+def _write_prompt_file(workspace: Path, name: str, content: str) -> str:
+    """Кладёт файл в input/prompts/ и возвращает относительный путь."""
+    prompts_dir = workspace / "input" / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    (prompts_dir / name).write_text(content, encoding="utf-8")
+    return f"input/prompts/{name}"
+
+
 # ---------------------------------------------------------------------------
 # _strip_code_fence
 # ---------------------------------------------------------------------------
@@ -99,7 +107,7 @@ def test_strip_code_fence_partial_untouched():
 
 
 # ---------------------------------------------------------------------------
-# _parse_guided_plan
+# _parse_guided_plan — базовые сценарии
 # ---------------------------------------------------------------------------
 
 def test_parse_plan_ru_summarize(guard: FileSystemGuard):
@@ -111,10 +119,10 @@ def test_parse_plan_ru_summarize(guard: FileSystemGuard):
     assert plan["operation"] == "summarize"
     assert plan["source"] == "input/article.md"
     assert plan["target"] == "output/summary.md"
+    assert plan["prompt_path"] is None
 
 
 def test_parse_plan_ru_display_only(guard: FileSystemGuard):
-    """Без целевого файла — guided mode только для чтения и вывода."""
     plan = _parse_guided_plan(
         "прочитай input/article.md и расскажи своими словами о чём он",
         guard,
@@ -123,6 +131,7 @@ def test_parse_plan_ru_display_only(guard: FileSystemGuard):
     assert plan["operation"] in ("summarize", "explain")
     assert plan["source"] == "input/article.md"
     assert plan["target"] is None
+    assert plan["prompt_path"] is None
 
 
 def test_parse_plan_en_summarize(guard: FileSystemGuard):
@@ -156,13 +165,116 @@ def test_parse_plan_no_paths(guard: FileSystemGuard):
 
 
 def test_parse_plan_source_missing(guard: FileSystemGuard):
-    """Путь-источник не существует и не разрешён на запись — плана нет."""
+    """Путь-источник не существует — плана нет."""
     plan = _parse_guided_plan(
         "прочитай input/missing.md и напиши резюме в output/summary.md",
         guard,
     )
-    # source не найден → None, autonomous fallback
     assert plan is None
+
+
+# ---------------------------------------------------------------------------
+# _parse_guided_plan — prompt-файл
+# ---------------------------------------------------------------------------
+
+def test_parse_plan_marker_ru(guard: FileSystemGuard,
+                               source_workspace: Path):
+    """Маркер «согласно инструкции из X» — X становится prompt_path."""
+    _write_prompt_file(source_workspace, "instr.md", "# Do X\n")
+    plan = _parse_guided_plan(
+        "прочитай input/article.md согласно инструкции из "
+        "input/prompts/instr.md, результат в output/summary.md",
+        guard,
+    )
+    assert plan is not None
+    assert plan["prompt_path"] == "input/prompts/instr.md"
+    assert plan["source"] == "input/article.md"
+    assert plan["target"] == "output/summary.md"
+
+
+def test_parse_plan_marker_en(guard: FileSystemGuard,
+                               source_workspace: Path):
+    _write_prompt_file(source_workspace, "instr.md", "# Do X\n")
+    plan = _parse_guided_plan(
+        "read input/article.md using prompt input/prompts/instr.md, "
+        "write result to output/summary.md",
+        guard,
+    )
+    assert plan is not None
+    assert plan["prompt_path"] == "input/prompts/instr.md"
+
+
+def test_parse_plan_convention_without_marker(guard: FileSystemGuard,
+                                               source_workspace: Path):
+    """Путь под input/prompts/ распознаётся без маркера."""
+    _write_prompt_file(source_workspace, "instr.md", "# Do X\n")
+    plan = _parse_guided_plan(
+        "прочитай input/article.md и примени input/prompts/instr.md, "
+        "результат в output/summary.md",
+        guard,
+    )
+    assert plan is not None
+    assert plan["prompt_path"] == "input/prompts/instr.md"
+    assert plan["source"] == "input/article.md"
+    assert plan["target"] == "output/summary.md"
+
+
+def test_parse_plan_custom_operation_without_keyword(
+        guard: FileSystemGuard, source_workspace: Path):
+    """Без ключевого слова, но с prompt-файлом → operation="custom"."""
+    _write_prompt_file(source_workspace, "instr.md", "# Do X\n")
+    plan = _parse_guided_plan(
+        "примени input/prompts/instr.md к input/article.md",
+        guard,
+    )
+    assert plan is not None
+    assert plan["operation"] == "custom"
+    assert plan["source"] == "input/article.md"
+    assert plan["target"] is None
+    assert plan["prompt_path"] == "input/prompts/instr.md"
+
+
+def test_parse_plan_marker_missing_file_ignored(guard: FileSystemGuard,
+                                                 source_workspace: Path):
+    """Маркер указывает на несуществующий файл — prompt_path=None."""
+    plan = _parse_guided_plan(
+        "прочитай input/article.md и напиши краткое резюме согласно "
+        "инструкции из input/prompts/missing.md в output/summary.md",
+        guard,
+    )
+    assert plan is not None
+    assert plan["operation"] == "summarize"
+    assert plan["prompt_path"] is None
+
+
+def test_parse_plan_prompt_not_treated_as_source(
+        guard: FileSystemGuard, source_workspace: Path):
+    """Prompt-файл не попадает в роли source."""
+    _write_prompt_file(source_workspace, "instr.md", "# Do X\n")
+    plan = _parse_guided_plan(
+        "прочитай input/prompts/instr.md согласно инструкции из "
+        "input/prompts/instr.md и input/article.md",  # игнорируем странность
+        guard,
+    )
+    assert plan is not None
+    # source — article.md, а не instr.md
+    assert plan["source"] == "input/article.md"
+    assert plan["prompt_path"] == "input/prompts/instr.md"
+
+
+def test_parse_plan_dot_slash_normalized(guard: FileSystemGuard,
+                                          source_workspace: Path):
+    """‘./input/prompts/x.md’ и ‘input/prompts/x.md’ — один путь."""
+    _write_prompt_file(source_workspace, "instr.md", "# Do X\n")
+    plan = _parse_guided_plan(
+        "прочитай input/article.md и напиши краткое резюме согласно "
+        "инструкции из ./input/prompts/instr.md в output/summary.md",
+        guard,
+    )
+    assert plan is not None
+    assert plan["prompt_path"] == "./input/prompts/instr.md"
+    # source не должен оказаться тем же файлом под другим именем
+    assert plan["source"] == "input/article.md"
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +291,9 @@ def test_guided_mode_writes_summary(guard: FileSystemGuard,
         "прочитай input/article.md и напиши краткое резюме в output/summary.md"
     )
 
-    # Ровно один вызов модели — трансформация. Без tools.
     assert len(client.calls) == 1
     assert "tools" not in client.calls[0]
 
-    # Результат — текст трансформации + pending_write.
     assert "Краткое резюме" in result["text"]
     assert len(result["pending_writes"]) == 1
     w = result["pending_writes"][0]
@@ -231,7 +341,6 @@ def test_guided_mode_handles_empty_response(guard: FileSystemGuard,
 
 def test_guided_mode_sends_source_content(guard: FileSystemGuard,
                                            source_workspace: Path):
-    """В промпт к модели должен попасть текст исходного файла."""
     client = ScriptedClient("Резюме.")
     agent = _make_agent(guard, source_workspace, client)
     agent.run(
@@ -246,13 +355,10 @@ def test_guided_mode_sends_source_content(guard: FileSystemGuard,
 
 def test_guided_mode_skipped_for_unknown_task(guard: FileSystemGuard,
                                                source_workspace: Path):
-    """Промпт без ключевых слов → autonomous mode (tools передаются)."""
-    # ScriptedClient вернёт текст, autonomous завершится после 1 раунда.
     client = ScriptedClient("Готово.")
     agent = _make_agent(guard, source_workspace, client)
     result = agent.run("посчитай файлы в input/")
 
-    # autonomous mode передаёт tools=TOOLS
     assert "tools" in client.calls[0]
     assert result["text"] == "Готово."
 
@@ -263,16 +369,14 @@ def test_guided_mode_skipped_for_unknown_task(guard: FileSystemGuard,
 
 def test_guided_retries_when_output_too_short(guard: FileSystemGuard,
                                                source_workspace: Path):
-    """Первый ответ "Тест" — 4 символа, сработает retry."""
     client = ScriptedClient(
-        "Тест",                                       # 1-й: плохо
-        "Это тестовый документ с двумя заголовками.", # 2-й: хорошо
+        "Тест",
+        "Это тестовый документ с двумя заголовками.",
     )
     agent = _make_agent(guard, source_workspace, client)
     result = agent.run(
         "прочитай input/article.md и напиши краткое резюме в output/summary.md"
     )
-    # Два вызова модели: первый + retry.
     assert len(client.calls) == 2
     assert result["pending_writes"][0]["content"] == \
         "Это тестовый документ с двумя заголовками."
@@ -280,13 +384,6 @@ def test_guided_retries_when_output_too_short(guard: FileSystemGuard,
 
 def test_guided_retries_when_output_is_copy(guard: FileSystemGuard,
                                              source_workspace: Path):
-    """Первый ответ — точная подстрока исходника, срабатывает copy-детектор.
-
-    Строка «Это тестовый файл с несколькими строками.» содержится
-    в input/article.md дословно. Её длина (41) выше length-порога,
-    поэтому retry вызывается именно проверкой копирования, а не
-    длиной.
-    """
     client = ScriptedClient(
         "Это тестовый файл с несколькими строками.",
         "Документ описывает тестовую структуру с двумя разделами.",
@@ -301,7 +398,6 @@ def test_guided_retries_when_output_is_copy(guard: FileSystemGuard,
 
 def test_guided_no_retry_when_output_is_good(guard: FileSystemGuard,
                                               source_workspace: Path):
-    """Хорошее резюме — retry не запускается."""
     client = ScriptedClient(
         "Документ содержит тестовую структуру с двумя заголовками "
         "и примерами форматирования."
@@ -315,10 +411,113 @@ def test_guided_no_retry_when_output_is_good(guard: FileSystemGuard,
 
 def test_guided_no_retry_for_non_summarize(guard: FileSystemGuard,
                                             source_workspace: Path):
-    """Для перевода короткий результат — нормально, retry не срабатывает."""
     client = ScriptedClient("Test")
     agent = _make_agent(guard, source_workspace, client)
     agent.run(
         "переведи input/article.md в output/translated.md"
     )
     assert len(client.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Guided mode + пользовательский prompt-файл
+# ---------------------------------------------------------------------------
+
+def test_guided_custom_prompt_replaces_system(
+        guard: FileSystemGuard, source_workspace: Path):
+    """Содержимое prompt-файла идёт в system, не смешиваясь с builtin."""
+    _write_prompt_file(source_workspace, "instr.md",
+                       "CUSTOM INSTRUCTION MARKER")
+    client = ScriptedClient(
+        "Осмысленный ответ по инструкции из трёх предложений."
+    )
+    agent = _make_agent(guard, source_workspace, client)
+    agent.run(
+        "прочитай input/article.md согласно инструкции из "
+        "input/prompts/instr.md, результат в output/summary.md"
+    )
+
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    # system = содержимое prompt-файла
+    assert "CUSTOM INSTRUCTION MARKER" in call["messages"][0]["content"]
+    # user НЕ содержит "Instruction:" (это маркер builtin-промпта)
+    assert "Instruction:" not in call["messages"][1]["content"]
+    # user содержит source и пути
+    assert "article.md" in call["messages"][1]["content"]
+
+
+def test_guided_custom_prompt_disables_retry(
+        guard: FileSystemGuard, source_workspace: Path):
+    """С кастомным prompt retry не срабатывает, даже если ответ короткий."""
+    _write_prompt_file(source_workspace, "instr.md", "Do it.")
+    # 2 символа — в builtin-режиме вызвало бы retry
+    client = ScriptedClient("Ок")
+    agent = _make_agent(guard, source_workspace, client)
+    agent.run(
+        "прочитай input/article.md согласно инструкции из "
+        "input/prompts/instr.md, результат в output/summary.md"
+    )
+    # Ровно один вызов
+    assert len(client.calls) == 1
+
+
+def test_guided_custom_prompt_uses_convention(
+        guard: FileSystemGuard, source_workspace: Path):
+    """Путь под input/prompts/ работает без маркера."""
+    _write_prompt_file(source_workspace, "instr.md",
+                       "INSTRUCTION FROM CONVENTION")
+    client = ScriptedClient(
+        "Результат трансформации по конвенции, три предложения текста."
+    )
+    agent = _make_agent(guard, source_workspace, client)
+    agent.run(
+        "прочитай input/article.md, примени input/prompts/instr.md, "
+        "результат в output/summary.md"
+    )
+    assert len(client.calls) == 1
+    assert "INSTRUCTION FROM CONVENTION" in \
+        client.calls[0]["messages"][0]["content"]
+
+
+def test_guided_missing_prompt_file_falls_back_to_builtin(
+        guard: FileSystemGuard, source_workspace: Path):
+    """Маркер указывает на несуществующий файл — builtin-промпт."""
+    client = ScriptedClient(
+        "Осмысленный ответ из трёх предложений, не копия исходника."
+    )
+    agent = _make_agent(guard, source_workspace, client)
+    agent.run(
+        "прочитай input/article.md и напиши краткое резюме согласно "
+        "инструкции из input/prompts/missing.md в output/summary.md"
+    )
+    # guided mode запустился, но с builtin-промптом: в user есть
+    # "Instruction:", в system — _TRANSFORM_SYSTEM
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert "Instruction:" in call["messages"][1]["content"]
+    assert "text transformation tool" in \
+        call["messages"][0]["content"].lower()
+
+
+def test_guided_custom_prompt_read_error_falls_back(
+        guard: FileSystemGuard, source_workspace: Path):
+    """Prompt-файл есть в плане, но не читается — builtin fallback.
+
+    Практически это возможно, если файл удалили между разбором
+    плана и чтением. Воспроизводим, удалив файл после _parse_guided_plan.
+    """
+    path = _write_prompt_file(source_workspace, "instr.md", "X" * 100)
+    # Удаляем до запуска — plan вернёт prompt_path=None
+    (source_workspace / path).unlink()
+    client = ScriptedClient(
+        "Достаточно длинный осмысленный ответ, не копия."
+    )
+    agent = _make_agent(guard, source_workspace, client)
+    agent.run(
+        "прочитай input/article.md согласно инструкции из "
+        "input/prompts/instr.md, результат в output/summary.md"
+    )
+    # prompt_path=None, builtin-промпт
+    call = client.calls[0]
+    assert "Instruction:" in call["messages"][1]["content"]
