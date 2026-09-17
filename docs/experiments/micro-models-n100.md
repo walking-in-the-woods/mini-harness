@@ -118,7 +118,7 @@
 ### Оценка
 
 - **Пунктов:** 5 из 5.
-- **Формат:** каждый пункт начинается с `- `, корректно.
+- **Формат:** каждый пункт начинается с `-`, корректно.
 - **Факты:** проверяемые, без воды.
 - **Дефект:** опечатка `биолюминесcentных` — смешаны кириллица и латиница. Редкий glitch токенизатора, не галлюцинация.
 - **Вывод:** структурированный вывод — сильная сторона 3B. Список выполнен идеально.
@@ -181,13 +181,13 @@ increment() и decrement().
 
 ### Команда
 
-```
+```sh
 прочитай input/counter.py согласно инструкции из input/prompts/add-methods.md, результат в output/code/counter_extended.py
 ```
 
 ### Вывод stderr
 
-```
+```sh
 [*] guided mode: custom input/counter.py -> output/code/counter_extended.py [prompt: input/prompts/add-methods.md]
 [*] custom model output: 'class Counter:     """Counter that increments or decrements by a fixed step."""      def __init__(self, start=0, step=1)' (752 chars)
 ```
@@ -328,13 +328,13 @@ def extract_emails(text):
 
 ### Команда
 
-```
+```sh
 прочитай input/text_utils.py согласно инструкции из input/prompts/add-docstrings.md, результат в output/code/text_utils_documented.py
 ```
 
 ### Вывод stderr
 
-```
+```sh
 [*] guided mode: custom input/text_utils.py -> output/code/text_utils_documented.py [prompt: input/prompts/add-docstrings.md]
 [*] custom model output: '"""Text processing utilities."""  import re   def clean_whitespace(text, collapse=True):     """     Removes extra white' (2037 chars)
 ```
@@ -484,6 +484,217 @@ def extract_emails(text):
 между «Открытие» и «Практика». Формулировка категорий как
 взаимоисключающих критична.
 
+## Тест 8: рефакторинг — выделение helper
+
+### Задача
+
+В `validators.py` три функции с одинаковой структурой проверок.
+Выделить общую часть в `_validate_basic`, вызвать из каждой
+`validate_*`, сохранить поведение без изменений.
+
+Первый тест, где модель должна **изменить** существующий код, а
+не добавить новый. Проверяется способность сохранять семантические
+инварианты (возвращаемое значение, точные сообщения, разницу
+между похожими условиями).
+
+### Исходный файл `input/validators.py`
+
+```python
+"""Basic validators for user-supplied identifiers."""
+
+
+def validate_username(name):
+    if not name:
+        raise ValueError("username is empty")
+    if len(name) > 32:
+        raise ValueError("username too long")
+    if not name.isalnum():
+        raise ValueError("username must be alphanumeric")
+    return True
+
+
+def validate_slug(slug):
+    if not slug:
+        raise ValueError("slug is empty")
+    if len(slug) > 64:
+        raise ValueError("slug too long")
+    cleaned = slug.replace("-", "").replace("_", "")
+    if not cleaned.isalnum():
+        raise ValueError("slug has invalid characters")
+    return True
+
+
+def validate_tag(tag):
+    if not tag:
+        raise ValueError("tag is empty")
+    if len(tag) > 16:
+        raise ValueError("tag too long")
+    if not tag.isalnum():
+        raise ValueError("tag must be alphanumeric")
+    return True
+```
+
+### Prompt-файл `input/prompts/refactor-validators.md`
+
+```markdown
+В файле validators.py три функции: validate_username, validate_slug,
+validate_tag. У всех трёх одинаковая структура проверок.
+
+Выдели общую часть в helper-функцию _validate_basic. Вызови её
+из каждой validate_*. Функции validate_username, validate_slug,
+validate_tag должны сохранить своё поведение без изменений.
+
+Параметры каждой функции:
+
+- validate_username: имя "username", лимит длины 32, разрешены
+  только латинские буквы и цифры.
+- validate_slug: имя "slug", лимит длины 64, разрешены латинские
+  буквы, цифры, дефис и подчёркивание.
+- validate_tag: имя "tag", лимит длины 16, разрешены только
+  латинские буквы и цифры.
+
+ВАЖНО: сообщения об ошибках должны остаться точно такими же, как
+в исходном файле. Для пустого значения — "<имя> is empty". Для
+слишком длинного — "<имя> too long". Для недопустимых символов
+у username и tag — "<имя> must be alphanumeric", у slug — "slug
+has invalid characters".
+
+ВАЖНО: выведи ВЕСЬ файл целиком, включая docstring модуля, все
+три функции и helper. Сохрани порядок функций. Не добавляй новых
+функций, кроме _validate_basic.
+
+Выведи только Python-код, без markdown-обёртки и без пояснений.
+```
+
+### Команда
+
+```sh
+прочитай input/validators.py согласно инструкции из input/prompts/refactor-validators.md, результат в output/code/validators_refactored.py
+```
+
+### Вывод stderr
+
+```sh
+[*] guided mode: custom input/validators.py -> output/code/validators_refactored.py [prompt: input/prompts/refactor-validators.md]
+[*] custom model output: '"""Basic validators for user-supplied identifiers."""   def _validate_basic(name, max_length, error_message):     if not' (634 chars)
+```
+
+### Результат
+
+```python
+"""Basic validators for user-supplied identifiers."""
+
+
+def _validate_basic(name, max_length, error_message):
+    if not name:
+        raise ValueError(f"{name} is empty")
+    if len(name) > max_length:
+        raise ValueError(f"{name} too long")
+    cleaned = name.replace("-", "").replace("_", "")
+    if not cleaned.isalnum():
+        raise ValueError(error_message)
+
+
+def validate_username(name):
+    _validate_basic(name, 32, "username must be alphanumeric")
+
+
+def validate_slug(slug):
+    _validate_basic(slug, 64, "slug has invalid characters")
+
+
+def validate_tag(tag):
+    _validate_basic(tag, 16, "tag must be alphanumeric")
+```
+
+См. также `artifacts/validators_refactored.py`.
+
+### Проверки
+
+**Синтаксис:**
+
+```sh
+$ python3 -m py_compile workspace/output/code/validators_refactored.py && echo "syntax OK"
+syntax OK
+```
+
+**Функциональный тест** (полный скрипт — в промпте теста) даёт
+четыре падения:
+
+```sh
+$ python3 -c "
+import sys
+sys.path.insert(0, 'workspace/output/code')
+from validators_refactored import (
+    validate_username, validate_slug, validate_tag
+)
+
+# --- validate_username ---
+assert validate_username('alice') is True   # FAIL: None is not True
+"
+AssertionError
+```
+
+### Оценка
+
+**Форма:** корректна. Helper создан, вызван из всех трёх функций,
+порядок функций сохранён, docstring модуля сохранён.
+
+**Семантика:** провалена в четырёх местах.
+
+1. **Возвращаемое значение изменилось.** Оригинал возвращал `True`
+   при успехе. Refactored возвращает `None` — helper ничего не
+   возвращает, а `validate_*` просто вызывают его без `return`.
+
+2. **Сообщение о пустом значении стало пустым.** `f"{name} is empty"`
+   при `name=""` даёт `" is empty"`. В оригинале была константа
+   `"username is empty"`.
+
+3. **Сообщение о длине содержит значение.** `f"{name} too long"`
+   для длинного name даёт «aaaa... too long». В оригинале —
+   `"username too long"`.
+
+4. **Проверка символов слишком мягкая.** Helper всегда удаляет
+   `-` и `_` перед `isalnum()`. Это верно для `slug`, но неверно
+   для `username` и `tag`, которые в оригинале требовали чистого
+   `isalnum()`. `validate_username('alice-bob')` теперь проходит,
+   хотя должен падать.
+
+### Разбор причин
+
+1. **Путаница в роли параметра `name`.** Промпт описывал «имя
+   "username"» — идентификатор для сообщений об ошибке. Модель
+   интерпретировала `name` как значение, которое валидируется,
+   и подставила его в f-строки вместо констант.
+
+2. **Возвращаемое значение не описано явно.** Формулировка
+   «сохранить поведение» слишком абстрактна для 3B. Модель
+   проверила исключения, но забыла про `return True`.
+
+3. **Условие для `slug` показалось лишним.** Модель
+   «унифицировала» три проверки до одного `replace.replace.isalnum()`,
+   не различив, что `username` и `tag` должны быть строже.
+
+### Сравнение с аддитивными задачами
+
+| Задача | Тип | Результат |
+| --- | --- | --- |
+| Добавить методы в класс | аддитивная | идеально |
+| Добавить docstrings | аддитивная | идеально |
+| Извлечь в список / таблицу | аддитивная | идеально |
+| **Выделить helper** | **рефакторинг** | **провал по семантике** |
+
+**Вывод:** 3B надёжны для аддитивных задач. При перестройке кода
+семантика теряется, даже если формальный шаблон соблюдён. Модель
+меняет «форму» кода, но не отслеживает, что при этом сохранить.
+
+Практический вывод для guided mode с 3B:
+
+- Задачи «добавь X» — да.
+- Задачи «измени X так, чтобы Y сохранилось» — нет.
+- Для рефакторинга нужны модели от 7B или специализированные
+  (qwen2.5-coder:7b, не 3b).
+
 ## Сводка
 
 | # | Задача | Модель | Требований | Выполнено | Итог |
@@ -494,6 +705,7 @@ def extract_emails(text):
 | 4 | Docstrings с условным `Raises:` | qwen2.5-coder:3b | 9 | 9 | идеально |
 | 5a | Таблица с классификацией | llama3.2:3b | 12 | 11 | успех |
 | 5b | Таблица с классификацией | qwen2.5-coder:3b | 12 | 10 | успех с оговоркой |
+| 8 | Рефакторинг: helper | qwen2.5-coder:3b | 9 | 5 | провал по семантике |
 
 ## Установленные границы
 
@@ -513,8 +725,12 @@ def extract_emails(text):
   практическую значимость.
 - **Классификация с пересекающимися категориями.** Выбор становится
   почти случайным на границе. Чем чётче разделены определения, тем
-  надёжнее результат. В тесте 5 обе модели ошиблись ровно там, где
-  категории семантически близки.
+  надёжнее результат.
+- **Рефакторинг с сохранением поведения.** 3B меняет форму кода,
+  но не отслеживает семантические инварианты (возвращаемые значения,
+  точные сообщения, разницу между похожими проверками). Форма
+  задачи соблюдается, поведение — нет. Это принципиальное
+  ограничение: аддитивные задачи работают, модифицирующие — нет.
 - **Длинные тексты.** Больше 2000 символов источника при
   `num_ctx=2048` начинают обрезаться.
 - **Reasoning-leakage.** `qwen3:4b` не подходит для guided mode:
@@ -542,5 +758,5 @@ reasoning) или остаться на 3B-моделях.
   при переполнении контекста.
 - **Тест 7:** перевод с сохранением markdown-разметки.
   `llama3.2:3b`.
-- **Тест 8:** рефакторинг — выделение общего helper из трёх функций.
-  Самый сложный структурный сценарий для 3B.
+- **Batch-режим.** Обработка коллекции файлов и скользящее окно
+  по длинному файлу. Архитектура обсуждается отдельно.
