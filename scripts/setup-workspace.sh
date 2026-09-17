@@ -6,6 +6,8 @@
 # нужно для запуска:
 #
 #   workspace/{input,output,notes,drafts}/
+#   workspace/output/code/                  — для .py, .sh и других
+#                                              WRITE_EXT_BLOCK-файлов
 #   workspace/input/prompts/
 #   workspace/sources.yaml.example          — шаблон источников
 #   workspace/sources.yaml                  — рабочий файл (не коммитится)
@@ -29,7 +31,7 @@ for arg in "$@"; do
     case "$arg" in
         --force) FORCE=1 ;;
         -h|--help)
-            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -48,6 +50,7 @@ for d in \
     workspace/input \
     workspace/input/prompts \
     workspace/output \
+    workspace/output/code \
     workspace/notes \
     workspace/drafts \
     logs ; do
@@ -228,3 +231,6 @@ echo
 echo "Prompt-файлы для guided mode:"
 echo "  tree-summary.md           минимальная версия (1.7B+)"
 echo "  tree-summary-detailed.md  полная версия с примерами (4B+)"
+echo
+echo "Запись файлов с кодом (.py, .sh и т. п.) разрешена только"
+echo "в workspace/output/code/ — см. fs.ext_allow_paths в config.yaml."

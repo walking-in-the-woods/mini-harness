@@ -192,6 +192,117 @@ def test_read_script_allowed(guard: FileSystemGuard):
 
 
 # --------------------------------------------------------------------------
+# ext_allow_paths — исключения из WRITE_EXT_BLOCK
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def policy_with_ext_allow(workspace: Path) -> dict:
+    """Writable включает output/code, ext_allow_paths разрешает .py там."""
+    return {
+        "root": str(workspace),
+        "whitelist": ["**"],
+        "blacklist": ["**/.git/**", "**/*.key"],
+        "writable": [
+            "notes/**",
+            "output/**",
+            "output/code/**",
+            "docs/**",
+            "*.md",
+            "*.txt",
+        ],
+        "ext_allow_paths": ["output/code/**"],
+    }
+
+
+@pytest.fixture
+def guard_ext(workspace: Path, policy_with_ext_allow: dict) -> FileSystemGuard:
+    return FileSystemGuard(policy_with_ext_allow)
+
+
+def test_py_in_ext_allow_path_allowed(guard_ext: FileSystemGuard):
+    """`.py` в output/code/ — разрешён."""
+    (guard_ext.root / "output" / "code").mkdir(parents=True, exist_ok=True)
+    ok, reason = guard_ext.check_write("output/code/counter.py")
+    assert ok, reason
+
+
+def test_py_outside_ext_allow_path_blocked(guard_ext: FileSystemGuard):
+    """`.py` вне output/code/ — по-прежнему заблокирован."""
+    ok, reason = guard_ext.check_write("output/counter.py")
+    assert not ok
+    assert "extension" in reason.lower()
+
+
+def test_py_in_notes_still_blocked(guard_ext: FileSystemGuard):
+    """`.py` в notes/ — заблокирован (notes не в ext_allow_paths)."""
+    ok, reason = guard_ext.check_write("notes/snippet.py")
+    assert not ok
+    assert "extension" in reason.lower()
+
+
+def test_sh_in_ext_allow_path_allowed(guard_ext: FileSystemGuard):
+    """Исключение работает для всех WRITE_EXT_BLOCK расширений, не только .py."""
+    (guard_ext.root / "output" / "code").mkdir(parents=True, exist_ok=True)
+    ok, reason = guard_ext.check_write("output/code/deploy.sh")
+    assert ok, reason
+
+
+def test_ext_allow_requires_writable(tmp_path: Path):
+    """Если путь не в writable — ext_allow_paths не помогает."""
+    (tmp_path / "output" / "code").mkdir(parents=True)
+    guard = FileSystemGuard({
+        "root": str(tmp_path),
+        "whitelist": ["**"],
+        "blacklist": [],
+        # writable НЕ содержит output/code
+        "writable": ["notes/**"],
+        "ext_allow_paths": ["output/code/**"],
+    })
+    ok, reason = guard.check_write("output/code/counter.py")
+    assert not ok
+    assert "writable" in reason.lower()
+
+
+def test_ext_allow_does_not_bypass_blacklist(tmp_path: Path):
+    """ext_allow_paths не обходит blacklist."""
+    (tmp_path / "output" / "code").mkdir(parents=True)
+    guard = FileSystemGuard({
+        "root": str(tmp_path),
+        "whitelist": ["**"],
+        "blacklist": ["**/secret.py"],
+        "writable": ["output/code/**"],
+        "ext_allow_paths": ["output/code/**"],
+    })
+    ok, reason = guard.check_write("output/code/secret.py")
+    assert not ok
+    assert "blacklist" in reason.lower()
+
+
+def test_ext_allow_does_not_bypass_whitelist(tmp_path: Path):
+    """ext_allow_paths не обходит whitelist."""
+    (tmp_path / "output" / "code").mkdir(parents=True)
+    guard = FileSystemGuard({
+        "root": str(tmp_path),
+        "whitelist": ["docs/**"],   # output не разрешён вообще
+        "blacklist": [],
+        "writable": ["output/code/**"],
+        "ext_allow_paths": ["output/code/**"],
+    })
+    ok, reason = guard.check_write("output/code/counter.py")
+    assert not ok
+    assert "whitelist" in reason.lower()
+
+
+def test_no_ext_allow_paths_behaves_as_before(guard: FileSystemGuard):
+    """Без ext_allow_paths — .py везде заблокирован, как раньше."""
+    assert not hasattr(guard, "ext_allow_paths") or \
+           guard.ext_allow_paths == []
+    ok, reason = guard.check_write("notes/a.py")
+    assert not ok
+    assert "extension" in reason.lower()
+
+
+# --------------------------------------------------------------------------
 # resolve_read / resolve_write
 # --------------------------------------------------------------------------
 

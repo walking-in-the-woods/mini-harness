@@ -5,11 +5,16 @@
 * os.path.realpath (symlink escape).
 * whitelist → blacklist последовательно.
 * Собственная glob→regex с поддержкой **.
+* Разделение read/write: расширения и writable — только к записи.
+* ext_allow_paths — исключения из WRITE_EXT_BLOCK для конкретных
+  директорий (например, output/code/** разрешает .py).
 
 Семантика списков:
 * whitelist: пустой = ничего не разрешено. Отсутствие ключа → ["**"].
 * blacklist: пустой = ничего не запрещено.
 * writable: пустой = запись везде запрещена.
+* ext_allow_paths: пустой или отсутствует = все WRITE_EXT_BLOCK
+  запрещены везде, как раньше.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from typing import Optional
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern:
+    """*  -> [^/]*; ?  -> [^/]; ** -> .*; **/ -> (?:.*/)?"""
     parts: list[str] = []
     i, n = 0, len(pattern)
     while i < n:
@@ -70,10 +76,16 @@ class FileSystemGuard:
         self.whitelist: list[str] = policy.get("whitelist", ["**"])
         self.blacklist: list[str] = policy.get("blacklist", [])
         self.writable: list[str] = policy.get("writable", [])
+        # Исключения из WRITE_EXT_BLOCK. Пустой список или
+        # отсутствие ключа = исключений нет.
+        self.ext_allow_paths: list[str] = policy.get("ext_allow_paths", [])
 
         self._wl = [_glob_to_regex(p) for p in self.whitelist]
         self._bl = [_glob_to_regex(p) for p in self.blacklist]
         self._wr = [_glob_to_regex(p) for p in self.writable]
+        self._ext_allow = [_glob_to_regex(p) for p in self.ext_allow_paths]
+
+    # -------------------------- public API ---------------------------------
 
     def check_read(self, rel: str) -> tuple[bool, str]:
         p, err = self._resolve(rel)
@@ -91,7 +103,16 @@ class FileSystemGuard:
             return False, err
         ext = p.suffix.lower()
         if ext in self.WRITE_EXT_BLOCK:
-            return False, f"extension {ext!r} blocked for writes (save as .txt)"
+            # Исключение: если путь матчит ext_allow_paths, расширение
+            # не блокируется. Остальные правила уже проверены выше
+            # (whitelist, blacklist) и будут проверены ниже (writable).
+            ext_allowed = any(r.match(rel_posix) for r in self._ext_allow)
+            if not ext_allowed:
+                return False, (
+                    f"extension {ext!r} blocked for writes "
+                    f"(save as .txt or use a directory listed "
+                    f"in ext_allow_paths)"
+                )
         if not self._wr:
             return False, "writes are disabled (empty 'writable' list)"
         if not any(r.match(rel_posix) for r in self._wr):
@@ -114,10 +135,15 @@ class FileSystemGuard:
             return None, err
         return self._resolve(rel)
 
+    # -------------------------- internals ----------------------------------
+
     def _resolve(self, rel: str) -> tuple[Optional[Path], str]:
         if not isinstance(rel, str) or not rel:
             return None, "empty path"
+
+        # NFKC нормализация: ловит гомоглифы и совместимые формы.
         rel = unicodedata.normalize("NFKC", rel)
+
         if "\x00" in rel:
             return None, "null byte in path"
 
@@ -126,10 +152,12 @@ class FileSystemGuard:
             parts = PurePosixPath(posix).parts
         except Exception as e:
             return None, f"invalid path: {e}"
+
         if any(p == ".." for p in parts):
             return None, "path traversal ('..') forbidden"
 
         candidate = self.root / posix
+        # realpath разворачивает ВСЕ symlink'и в цепочке компонентов.
         try:
             real = Path(os.path.realpath(candidate))
         except OSError as e:
@@ -139,9 +167,11 @@ class FileSystemGuard:
             real.relative_to(self.root)
         except ValueError:
             return None, f"path escapes workspace root: {rel}"
+
         return real, ""
 
     def _match_lists(self, rel_posix: str) -> tuple[bool, str]:
+        # Пустой whitelist → _wl = [] → any([]) = False → всё запрещено.
         if not any(r.match(rel_posix) for r in self._wl):
             return False, f"not in whitelist: {rel_posix}"
         if any(r.match(rel_posix) for r in self._bl):

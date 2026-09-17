@@ -190,11 +190,7 @@ def _write_to_input(workspace: Path, filename: str, body: str) -> Path:
 
 def _handle_source_command(user_input: str, registry: SourceRegistry,
                             workspace: Path) -> bool:
-    """Обрабатывает /sources, /tree, /files, /dump, /reload.
-
-    Возвращает True, если команда была обработана. False — если это
-    не команда источников (пусть обрабатывается дальше).
-    """
+    """Обрабатывает /sources, /tree, /files, /dump, /reload."""
     if user_input == "/sources":
         _print_sources(registry, workspace)
         return True
@@ -293,6 +289,7 @@ def main() -> None:
         "whitelist": cfg["fs"].get("whitelist", ["**"]),
         "blacklist": cfg["fs"].get("blacklist", []),
         "writable": cfg["fs"].get("writable", []),
+        "ext_allow_paths": cfg["fs"].get("ext_allow_paths", []),
     }
     try:
         guard = FileSystemGuard(fs_policy)
