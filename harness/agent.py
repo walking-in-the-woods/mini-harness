@@ -31,6 +31,14 @@ Reasoning-leakage: некоторые модели (qwen3:4b и родствен
    возвращает [STOP] без propose_write. Nonce не показывается,
    пользователь не может случайно подтвердить мусор.
 
+Batch-режим использует публичный метод transform_for_batch: одна
+трансформация с custom prompt + retry при reasoning. Параметр
+retry_hint позволяет batch-режиму передать короткий текст-хинт,
+который вставляется в начало user message при повторной попытке
+после структурной ошибки. Хинт живёт в user, а не в system: system
+уже занят prompt-файлом, а длинный составной system модель читает
+хуже.
+
 think=False передаётся всегда (для совместимости с ollama-версиями,
 где он работает). tool_calls от ollama >= 0.4 приходят как
 dataclass-объекты, не dict — нормализуем в _tool_call_to_dict.
@@ -347,14 +355,7 @@ def _looks_like_bad_summary(text: str, source: str) -> str | None:
 
 
 def _looks_like_reasoning(text: str) -> str | None:
-    """Причина, если текст похож на reasoning, иначе None.
-
-    Признаки:
-    * Первая строка начинается с мета-маркера.
-    * Текст содержит ≥3 мета-маркеров.
-    * Длина текста > 3000 символов при отсутствии видимых абзацев
-      ответа — почти всегда признак незавершённого reasoning.
-    """
+    """Причина, если текст похож на reasoning, иначе None."""
     if not text or not text.strip():
         return None
 
@@ -623,6 +624,65 @@ class HarnessAgent:
 
         return self._run_autonomous(user_prompt)
 
+    def transform_for_batch(self, source_path: str,
+                            source_content: str,
+                            prompt_content: str,
+                            retry_hint: str | None = None
+                            ) -> tuple[str | None, str | None]:
+        """Одна guided-трансформация с custom prompt + retry при reasoning.
+
+        Используется batch-режимом. Внутри вызывает `_transform_text`
+        (тот же метод, что в одиночном guided mode) и делает одну
+        повторную попытку при обнаружении reasoning-leakage.
+
+        retry_hint — короткий текст, который вставляется в начало
+        user message при повторной попытке. Используется batch-режимом
+        для структурного retry (когда модель потеряла часть кода).
+        Живёт в user message, а не в system: system уже занят
+        prompt-файлом, а длинный составной system модель читает хуже,
+        чем короткий user-префикс.
+
+        Возвращает (result, error):
+          * (строка, None)    — успех
+          * (None, причина)   — провал: empty, reasoning после retry,
+                                ошибка ollama
+        """
+        result = self._transform_text(
+            instruction="",
+            source_path=source_path,
+            source_content=source_content,
+            custom_prompt=prompt_content,
+            retry_hint=retry_hint,
+        )
+        if result is None:
+            return None, "empty transform"
+
+        reason = _looks_like_reasoning(result)
+        if reason:
+            print(f"    [!] reasoning: {reason}; retry",
+                  file=sys.stderr, flush=True)
+            self.audit.write("batch_retry",
+                             source=source_path,
+                             reason=f"reasoning: {reason}")
+            # Retry при reasoning: retry_hint не нужен, пробуем
+            # штатный retry-промпт. Если hint уже был задан —
+            # сохраняем его, он не мешает.
+            retried = self._transform_text(
+                instruction="",
+                source_path=source_path,
+                source_content=source_content,
+                custom_prompt=_RETRY_HEADER + prompt_content,
+                retry_hint=retry_hint,
+            )
+            if retried is None:
+                return None, "retry returned empty"
+            second = _looks_like_reasoning(retried)
+            if second:
+                return None, f"reasoning leaked twice: {second}"
+            result = retried
+
+        return result, None
+
     # ------------------------ guided mode ----------------------------------
 
     def _try_guided_run(self, user_prompt: str) -> dict | None:
@@ -672,12 +732,6 @@ class HarnessAgent:
             user_prompt, plan["source"], content,
             custom_prompt=custom_prompt,
         )
-
-        # Retry-логика:
-        # 1. Reasoning-leakage — работает и для custom prompt.
-        # 2. Если после retry снова reasoning — жёсткий отказ без
-        #    propose_write. Пользователь не может подтвердить мусор.
-        # 3. Для встроенного summarize — короткий ответ или копия.
 
         reasoning_reason = None
         if transformed is not None:
@@ -774,16 +828,22 @@ class HarnessAgent:
     def _transform_text(self, instruction: str, source_path: str,
                         source_content: str,
                         *, retry: bool = False,
-                        custom_prompt: str | None = None) -> str | None:
+                        custom_prompt: str | None = None,
+                        retry_hint: str | None = None) -> str | None:
         """Один вызов модели БЕЗ tools.
 
         В конец system-промпта добавляется маркер /no_think — для
-        qwen3 это активатор режима без reasoning на уровне
-        chat-template. Для остальных моделей — безвредный текст.
+        qwen3 это активатор режима без reasoning.
+
+        retry_hint, если задан, вставляется в начало user message.
+        Короткий префикс в user читается моделью надёжнее, чем
+        дополнительный текст в system.
         """
         if custom_prompt is not None:
             system = custom_prompt
+            prefix = f"{retry_hint}\n\n" if retry_hint else ""
             user_msg = (
+                f"{prefix}"
                 f"Источник ({source_path}):\n"
                 f"---BEGIN---\n{source_content}\n---END---\n\n"
                 f"Примени инструкцию из системного сообщения."

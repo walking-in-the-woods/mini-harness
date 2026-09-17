@@ -4,17 +4,14 @@
 Читает .env (скаляры) и config.yaml (политики и маршруты).
 Конкретных моделей и марок в коде нет — всё приходит из .env.
 
-Приоритет источников: .env выигрывает у унаследованного окружения.
-Если переменная уже была в os.environ с другим значением, файл её
-перезапишет и напечатает warning. Это защищает от ситуации «поменял
-.env, а модель та же».
-
 Команды пользователя (не модели):
   /sources                     список источников
   /tree <name> [subpath]       дерево -> input/_tree_<name>.md
   /files <name> [subpath]      плоский список -> input/_files_<name>.md
   /dump <name> [subpath]       содержимое -> input/_dump_<name>.md
   /reload                      перечитать sources.yaml
+  /batch <src> <glob> <prompt> [<target>]
+                               пакетная обработка директории
 """
 
 from __future__ import annotations
@@ -27,6 +24,7 @@ import yaml
 
 from harness.agent import HarnessAgent
 from harness.audit import AuditLog
+from harness.batch import BatchRunner
 from harness.confirm import ConfirmSession
 from harness.fs_guard import FileSystemGuard
 from harness.proxy import ApiProxy
@@ -47,6 +45,7 @@ BANNER_TEMPLATE = """
   /quit  — выход
   /reset — новая сессия (сброс состояния)
   /sources, /tree, /files, /dump, /reload — внешние источники
+  /batch <src> <glob> <prompt> [<target>] — пакетная обработка
 ============================================================
 """
 
@@ -255,6 +254,50 @@ def _handle_source_command(user_input: str, registry: SourceRegistry,
     return False
 
 
+# ── Команды batch ─────────────────────────────────────────────────────────
+
+def _handle_batch_command(user_input: str, agent: HarnessAgent,
+                           guard: FileSystemGuard, workspace: Path,
+                           audit: AuditLog) -> bool:
+    """Обрабатывает /batch.
+
+    Формат: /batch <source_dir> <glob> <prompt_path> [<target_dir>]
+    """
+    if not user_input.startswith("/batch"):
+        return False
+
+    if user_input == "/batch":
+        print("[!] usage: /batch <source_dir> <glob> <prompt_path> "
+              "[<target_dir>]")
+        print("    пример: /batch input/batch '*.py' "
+              "input/prompts/add-docstrings-generic.md")
+        return True
+
+    rest = user_input[len("/batch"):].strip()
+    parts = rest.split()
+    if len(parts) < 3:
+        print("[!] нужно минимум 3 аргумента: "
+              "<source_dir> <glob> <prompt_path>")
+        return True
+    if len(parts) > 4:
+        print("[!] максимум 4 аргумента: "
+              "<source_dir> <glob> <prompt_path> [<target_dir>]")
+        return True
+
+    source_dir = parts[0]
+    glob_pattern = parts[1].strip("'\"")
+    prompt_path = parts[2]
+    target_dir = parts[3] if len(parts) == 4 else None
+
+    runner = BatchRunner(agent, guard, workspace, audit,
+                          target_dir=target_dir)
+    try:
+        runner.run(source_dir, glob_pattern, prompt_path)
+    except Exception as e:
+        print(f"[!] batch failed: {type(e).__name__}: {e}")
+    return True
+
+
 # ── main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -263,7 +306,6 @@ def main() -> None:
     workspace = (BASE_DIR / cfg["workspace_root"]).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # Реестр источников — ДО баннера, чтобы отобразить их количество.
     try:
         registry = SourceRegistry(
             workspace_dir=workspace,
@@ -326,9 +368,10 @@ def main() -> None:
             print("[session reset]")
             continue
 
-        # Команды источников — до agent.run(), чтобы они не уходили
-        # в модель как обычный текст.
         if _handle_source_command(user_input, registry, workspace):
+            continue
+
+        if _handle_batch_command(user_input, agent, guard, workspace, audit):
             continue
 
         try:

@@ -15,6 +15,17 @@
 * writable: пустой = запись везде запрещена.
 * ext_allow_paths: пустой или отсутствует = все WRITE_EXT_BLOCK
   запрещены везде, как раньше.
+
+Порядок проверок в check_write:
+  1. whitelist / blacklist (через _match_lists)
+  2. writable: путь вообще разрешён для записи?
+  3. extension: если расширение в WRITE_EXT_BLOCK, проверить
+     ext_allow_paths.
+
+Порядок 2 → 3 выбран так, чтобы диагностика была точной: если
+путь вне writable, пользователь получает сообщение про writable,
+а не про extension. Раньше порядок был обратным, и сообщение
+про extension сбивало с толку, когда реальная причина — writable.
 """
 
 from __future__ import annotations
@@ -98,14 +109,22 @@ class FileSystemGuard:
         if p is None:
             return False, err
         rel_posix = p.relative_to(self.root).as_posix()
+
+        # 1. whitelist / blacklist
         ok, err = self._match_lists(rel_posix)
         if not ok:
             return False, err
+
+        # 2. writable — путь вообще разрешён для записи?
+        if not self._wr:
+            return False, "writes are disabled (empty 'writable' list)"
+        if not any(r.match(rel_posix) for r in self._wr):
+            return False, f"path not in writable list: {rel_posix}"
+
+        # 3. extension — блокировка .py/.sh/... с исключением
+        #    по ext_allow_paths.
         ext = p.suffix.lower()
         if ext in self.WRITE_EXT_BLOCK:
-            # Исключение: если путь матчит ext_allow_paths, расширение
-            # не блокируется. Остальные правила уже проверены выше
-            # (whitelist, blacklist) и будут проверены ниже (writable).
             ext_allowed = any(r.match(rel_posix) for r in self._ext_allow)
             if not ext_allowed:
                 return False, (
@@ -113,10 +132,7 @@ class FileSystemGuard:
                     f"(save as .txt or use a directory listed "
                     f"in ext_allow_paths)"
                 )
-        if not self._wr:
-            return False, "writes are disabled (empty 'writable' list)"
-        if not any(r.match(rel_posix) for r in self._wr):
-            return False, f"path not in writable list: {rel_posix}"
+
         return True, "OK"
 
     def resolve_read(self, rel: str) -> tuple[Optional[Path], str]:

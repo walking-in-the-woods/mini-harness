@@ -37,6 +37,7 @@ fs:
   writable:
     - "output/**"
     - "output/code/**"
+    - "output/batch/**"
     - "notes/**"
     - "drafts/**"
     - "*.md"
@@ -53,8 +54,13 @@ fs:
   #
   # Пустой список или отсутствие ключа — поведение как раньше,
   # все расширения из WRITE_EXT_BLOCK запрещены.
+  #
+  # output/code/**    — для одиночных guided-mode задач с кодом
+  # output/batch/**   — для batch-режима (docstrings, рефакторинг
+  #                     кода в пакете)
   ext_allow_paths:
     - "output/code/**"
+    - "output/batch/**"
 
 proxy:
   # Хост берётся ЗДЕСЬ, не из аргументов модели. Это закрывает SSRF.
