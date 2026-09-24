@@ -11,7 +11,8 @@
 #      зависимости), а не только существует.
 #   4. Создаёт .env из .env.example, если файла нет.
 #   5. Информационно проверяет, отвечает ли сервер инференса.
-#      Не блокирует запуск.
+#      Не блокирует запуск. Хост выбирается по HARNESS_BACKEND:
+#      ollama -> OLLAMA_HOST, llamacpp -> LLAMACPP_HOST.
 #   6. Инициализирует workspace через scripts/setup-workspace.sh:
 #      дерево каталогов, sources.yaml.example, sources.yaml,
 #      prompt-файлы. Идемпотентно: при повторных запусках —
@@ -38,9 +39,6 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # ── Проверка ensurepip ────────────────────────────────────────────────────
-# ensurepip — то, чего не хватает без pythonX.Y-venv на Debian/Ubuntu.
-# Проверяем до создания venv, чтобы дать внятный совет, а не трейсбек
-# из недр venv.
 if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
     PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
     echo "[!] Модуль ensurepip недоступен — venv не сможет установить pip." >&2
@@ -54,9 +52,6 @@ if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
 fi
 
 # ── Проверка, что .venv рабочий ───────────────────────────────────────────
-# Тестируем импорт всех трёх зависимостей. Если хотя бы одна не
-# импортируется — venv считается сломанным (например, прерванный
-# pip install оставил пустую директорию) и пересоздаётся.
 venv_ok=0
 if [[ -x .venv/bin/python ]]; then
     if ./.venv/bin/python -c \
@@ -86,24 +81,37 @@ fi
 # Не блокирует запуск: если сервер поднялся через 10 секунд после
 # run.sh, REPL уже ждёт и следующий ввод сработает. Если curl нет —
 # проверка пропускается.
-HOST="$(grep -E '^OLLAMA_HOST=' .env | cut -d= -f2- || true)"
-HOST="${HOST:-http://127.0.0.1:11434}"
-if command -v curl >/dev/null 2>&1; then
-    if ! curl -sf "${HOST}/api/tags" >/dev/null 2>&1; then
-        echo "[i] Локальный сервер не отвечает на ${HOST}."
-        echo "    Убедитесь, что он запущен, и что модель из .env загружена."
+BACKEND="$(grep -E '^HARNESS_BACKEND=' .env | cut -d= -f2- | tr -d '[:space:]' || true)"
+BACKEND="${BACKEND:-ollama}"
+
+if [[ "$BACKEND" == "llamacpp" || "$BACKEND" == "llama.cpp" || \
+      "$BACKEND" == "llama-cpp" || "$BACKEND" == "llama_cpp" ]]; then
+    HOST="$(grep -E '^LLAMACPP_HOST=' .env | cut -d= -f2- || true)"
+    HOST="${HOST:-http://127.0.0.1:8080}"
+    HEALTH_URL="${HOST%/}/health"
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
+            echo "[i] llama-server не отвечает на ${HOST}."
+            echo "    Запустите ~/Desktop/run-coder3b.sh (порт 8080)"
+            echo "    или run-coder7b.sh (порт 8082)."
+        fi
+    fi
+else
+    HOST="$(grep -E '^OLLAMA_HOST=' .env | cut -d= -f2- || true)"
+    HOST="${HOST:-http://127.0.0.1:11434}"
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -sf "${HOST}/api/tags" >/dev/null 2>&1; then
+            echo "[i] Ollama не отвечает на ${HOST}."
+            echo "    Убедитесь, что 'ollama serve' запущен, и что"
+            echo "    модель из HARNESS_MODEL загружена."
+        fi
     fi
 fi
 
 # ── Инициализация workspace ───────────────────────────────────────────────
-# На первом запуске после клона workspace/ пуст — всё содержимое
-# матчится `workspace/*` в .gitignore. setup-workspace.sh создаёт
-# дерево каталогов, sources.yaml.example, sources.yaml и prompt-файлы.
-# Идемпотентен: при повторных запусках ничего не перезаписывает.
 if [[ -f scripts/setup-workspace.sh ]]; then
     bash scripts/setup-workspace.sh
 else
-    # Fallback для старых клонов, где скрипта ещё нет.
     mkdir -p workspace/input workspace/output \
              workspace/notes workspace/drafts logs
 fi

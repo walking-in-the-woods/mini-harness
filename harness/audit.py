@@ -9,13 +9,19 @@ from pathlib import Path
 from typing import Any
 
 
+# Durable-события пишутся с fsync. Список намеренно узкий: только
+# то, что нельзя потерять при сбое питания между write и закрытием
+# файла. Всё остальное — flush без fsync.
+#
+# backend_error заменил прежнее ollama_error: с появлением
+# llama.cpp-бэкенда имя движка в аудите перестало быть осмысленным.
 _DURABLE_EVENTS = frozenset({
     "session_start",
     "session_end",
     "apply_result",
     "propose_write",
     "user_prompt_blocked",
-    "ollama_error",
+    "backend_error",
 })
 
 

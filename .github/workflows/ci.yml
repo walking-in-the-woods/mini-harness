@@ -33,15 +33,23 @@ jobs:
           done
 
       - name: Python syntax check
-        run: python -m py_compile harness/*.py
+        run: python -m py_compile harness/*.py harness/backends/*.py
 
       - name: Import check
-        # Пустой .env — импорт не должен требовать модели на уровне модуля.
+        # Пустой .env — импорт не должен требовать модели или живого
+        # сервера на уровне модуля. Список модулей включает оба
+        # бэкенда: OllamaBackend без сервера не падает (только
+        # создаёт клиента), LlamaCppBackend вообще не ходит в сеть
+        # при конструировании.
         run: |
           touch .env
           python -c "import harness.agent; import harness.fs_guard; \
                      import harness.injection_guard; import harness.confirm; \
-                     import harness.audit; import harness.proxy"
+                     import harness.audit; import harness.proxy; \
+                     import harness.backends; \
+                     import harness.backends.base; \
+                     import harness.backends.ollama_backend; \
+                     import harness.backends.llamacpp_backend"
 
   tests:
     needs: static-checks

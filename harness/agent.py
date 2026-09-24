@@ -39,9 +39,20 @@ retry_hint позволяет batch-режиму передать коротки
 уже занят prompt-файлом, а длинный составной system модель читает
 хуже.
 
-think=False передаётся всегда (для совместимости с ollama-версиями,
-где он работает). tool_calls от ollama >= 0.4 приходят как
-dataclass-объекты, не dict — нормализуем в _tool_call_to_dict.
+Бэкенд инференса абстрагирован через harness.backends.ChatBackend.
+Поддерживаются два:
+
+* OllamaBackend — нативный ollama-python, использует options={...},
+  think=, keep_alive=.
+
+* LlamaCppBackend — прямой POST на /v1/chat/completions
+  llama-server. Параметры num_ctx, keep_alive, think игнорируются
+  на уровне бэкенда: контекст задаётся при старте сервера
+  (--ctx-size), модель всегда в RAM, reasoning-фаза отсутствует.
+
+tool_calls от ollama >= 0.4 приходят как dataclass-объекты, не dict —
+нормализуем в _tool_call_to_dict. LlamaCppBackend нормализует
+аргументы tool_call в dict сам (OpenAI отдаёт их JSON-строкой).
 """
 
 from __future__ import annotations
@@ -54,9 +65,13 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
-import ollama
-
 from harness.audit import AuditLog
+from harness.backends import (
+    BackendError,
+    ChatBackend,
+    OllamaBackend,
+    build_backend,
+)
 from harness.fs_guard import FileSystemGuard
 from harness.injection_guard import InjectionGuard
 from harness.proxy import ApiProxy
@@ -560,10 +575,25 @@ def _parse_guided_plan(prompt: str, fs_guard: FileSystemGuard) -> dict | None:
 
 
 class HarnessAgent:
+    """Tool-loop поверх ChatBackend.
+
+    Бэкенд инференса передаётся одним из трёх способов:
+
+    1. backend=<ChatBackend> — явная подстановка (используется в
+       тестах llama.cpp-бэкенда и при внешнем конфигурировании).
+
+    2. client=<object с .chat(**kwargs)> — обратная совместимость
+       с прежней сигнатурой: клиент оборачивается в OllamaBackend.
+       Так работают все существующие тесты.
+
+    3. Ничего не передано — build_backend(cfg) по cfg["backend"].
+       Значение по умолчанию — "ollama".
+    """
 
     def __init__(self, cfg: dict, fs_guard: FileSystemGuard,
                  proxy: ApiProxy, audit: AuditLog, *,
-                 client: Any | None = None):
+                 client: Any | None = None,
+                 backend: ChatBackend | None = None):
         self.cfg = cfg
         self.workspace = Path(cfg["workspace_root"]).resolve()
         self.fs_guard = fs_guard
@@ -577,9 +607,18 @@ class HarnessAgent:
         self.keep_alive = cfg["keep_alive"]
         self.temperature = float(cfg["temperature"])
 
-        self.client = client if client is not None else ollama.Client(
-            host=cfg["ollama_host"]
-        )
+        # Приоритет: явный backend → устаревший client → фабрика.
+        # Устаревший client сохранён ради тестов и внешних интеграций,
+        # которые передают готовый ollama.Client или его мок.
+        if backend is not None:
+            self.backend: ChatBackend = backend
+        elif client is not None:
+            self.backend = OllamaBackend.from_client(
+                client,
+                host=cfg.get("ollama_host") or "http://127.0.0.1:11434",
+            )
+        else:
+            self.backend = build_backend(cfg)
 
         self.max_tool_rounds = int(cfg["max_tool_rounds"])
         self.max_read = int(cfg["max_read_bytes"])
@@ -645,7 +684,7 @@ class HarnessAgent:
         Возвращает (result, error):
           * (строка, None)    — успех
           * (None, причина)   — провал: empty, reasoning после retry,
-                                ошибка ollama
+                                ошибка backend
         """
         result = self._transform_text(
             instruction="",
@@ -838,6 +877,10 @@ class HarnessAgent:
         retry_hint, если задан, вставляется в начало user message.
         Короткий префикс в user читается моделью надёжнее, чем
         дополнительный текст в system.
+
+        Параметры num_ctx, keep_alive и think бэкенд может
+        игнорировать: llama.cpp задаёт контекст на старте сервера
+        и не поддерживает reasoning-фазу.
         """
         if custom_prompt is not None:
             system = custom_prompt
@@ -862,22 +905,22 @@ class HarnessAgent:
         system = system + _NO_THINK
 
         try:
-            resp = self.client.chat(
+            resp = self.backend.chat(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
                 ],
                 think=False,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": self.num_predict,
-                    "num_ctx": self.num_ctx,
-                },
+                temperature=self.temperature,
+                num_predict=self.num_predict,
+                num_ctx=self.num_ctx,
                 keep_alive=self.keep_alive,
             )
         except Exception as e:
-            self.audit.write("ollama_error", error=str(e))
+            self.audit.write("backend_error",
+                             backend=self.backend.name,
+                             error=str(e))
             return None
 
         msg = resp.get("message") or {}
@@ -905,21 +948,22 @@ class HarnessAgent:
                   file=sys.stderr, flush=True)
 
             try:
-                resp = self.client.chat(
+                resp = self.backend.chat(
                     model=self.model,
                     messages=messages,
                     tools=TOOLS,
                     think=False,
-                    options={
-                        "temperature": self.temperature,
-                        "num_predict": self.num_predict,
-                        "num_ctx": self.num_ctx,
-                    },
+                    temperature=self.temperature,
+                    num_predict=self.num_predict,
+                    num_ctx=self.num_ctx,
                     keep_alive=self.keep_alive,
                 )
             except Exception as e:
-                self.audit.write("ollama_error", error=str(e))
-                return {"text": f"[ollama error] {e}", "pending_writes": []}
+                self.audit.write("backend_error",
+                                 backend=self.backend.name,
+                                 error=str(e))
+                return {"text": f"[backend error] {e}",
+                        "pending_writes": []}
 
             msg = resp.get("message") or {}
             content = msg.get("content") or ""

@@ -4,6 +4,12 @@
 Читает .env (скаляры) и config.yaml (политики и маршруты).
 Конкретных моделей и марок в коде нет — всё приходит из .env.
 
+Бэкенд инференса выбирается через HARNESS_BACKEND:
+  * ollama   (по умолчанию) — нативный ollama-python,
+    адрес в OLLAMA_HOST.
+  * llamacpp — прямой OpenAI-совместимый HTTP, адрес в
+    LLAMACPP_HOST (обычно http://127.0.0.1:8080 или :8082).
+
 Команды пользователя (не модели):
   /sources                     список источников
   /tree <name> [subpath]       дерево -> input/_tree_<name>.md
@@ -24,6 +30,7 @@ import yaml
 
 from harness.agent import HarnessAgent
 from harness.audit import AuditLog
+from harness.backends import BackendError, ChatBackend, build_backend
 from harness.batch import BatchRunner
 from harness.confirm import ConfirmSession
 from harness.fs_guard import FileSystemGuard
@@ -35,6 +42,7 @@ BANNER_TEMPLATE = """
 ============================================================
   Mini Harness — локальный ассистент без контейнеров
 
+  backend:      {backend}
   model:        {model}
   host:         {host}
   num_ctx:      {num_ctx}
@@ -121,16 +129,37 @@ def load_runtime_config() -> dict:
     fs_cfg = raw.get("fs") or {}
     proxy_cfg = raw.get("proxy") or {}
 
+    backend = os.environ.get("HARNESS_BACKEND", "ollama").strip().lower()
+
+    # Модель обязательна только для ollama: llama-server обслуживает
+    # одну модель, загруженную при старте, и поле "model" в запросе
+    # фактически игнорируется. Пользователю всё равно нужна метка —
+    # она летит в теле запроса и попадает в аудит.
     model = os.environ.get("HARNESS_MODEL", "").strip()
     if not model:
-        print("[fatal] HARNESS_MODEL не задан в .env", file=sys.stderr)
-        sys.exit(1)
+        if backend in ("llamacpp", "llama.cpp", "llama-cpp", "llama_cpp"):
+            model = "llamacpp-local"
+            print("[i] HARNESS_MODEL не задан; использую метку "
+                  "'llamacpp-local' (llama-server игнорирует поле model)",
+                  file=sys.stderr)
+        else:
+            print("[fatal] HARNESS_MODEL не задан в .env", file=sys.stderr)
+            sys.exit(1)
 
     return {
+        "backend": backend,
         "model": model,
         "ollama_host": os.environ.get(
             "OLLAMA_HOST", "http://127.0.0.1:11434"
         ),
+        "llamacpp_host": os.environ.get(
+            "LLAMACPP_HOST", "http://127.0.0.1:8080"
+        ),
+        "llamacpp_api_key": os.environ.get("LLAMACPP_API_KEY", "").strip(),
+        # 300 секунд, не 30. На N100+7B Q4 генерация идёт ~2–4 t/s;
+        # ответ на 1024 токена занимает 4–8 минут. 30 секунд
+        # отваливается на середине.
+        "llamacpp_timeout": _env_float("LLAMACPP_TIMEOUT", 300.0),
         "num_ctx": _env_int("HARNESS_NUM_CTX", 2048),
         "num_predict": _env_int("HARNESS_NUM_PREDICT", 1024),
         "keep_alive": os.environ.get("HARNESS_KEEP_ALIVE", "5m"),
@@ -298,6 +327,40 @@ def _handle_batch_command(user_input: str, agent: HarnessAgent,
     return True
 
 
+# ── Диагностика бэкенда ───────────────────────────────────────────────────
+
+def _backend_diagnose(backend: ChatBackend, cfg: dict) -> None:
+    """Информационная проверка бэкенда. Не блокирует запуск.
+
+    Печатает строку "[i] ..." если сервер не отвечает. Точная
+    подсказка зависит от бэкенда: у ollama это "ollama serve
+    запущен?", у llama.cpp — "llama-server запущен и модели
+    подгружены через --load-mode mlock?".
+    """
+    try:
+        ok = backend.health()
+    except Exception:
+        ok = False
+
+    if ok:
+        return
+
+    if backend.name == "ollama":
+        host = cfg.get("ollama_host", "?")
+        print(f"[i] Ollama не отвечает на {host}.")
+        print("    Убедитесь, что 'ollama serve' запущен, а модель "
+              "из HARNESS_MODEL загружена.")
+    elif backend.name == "llamacpp":
+        host = cfg.get("llamacpp_host", "?")
+        print(f"[i] llama-server не отвечает на {host}.")
+        print("    Запустите ./Desktop/run-coder3b.sh (порт 8080) "
+              "или run-coder7b.sh (порт 8082).")
+        print("    Проверьте в браузере: " + host + "/health")
+    else:
+        print(f"[i] Бэкенд {backend.name!r} не отвечает. "
+              f"Проверьте адрес и запуск сервера.")
+
+
 # ── main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -305,6 +368,15 @@ def main() -> None:
 
     workspace = (BASE_DIR / cfg["workspace_root"]).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
+
+    # Бэкенд строим до баннера: если конфигурация неверная —
+    # пользователь увидит понятную ошибку и не потратит время на
+    # ввод запроса, который всё равно упадёт.
+    try:
+        backend = build_backend(cfg)
+    except BackendError as e:
+        print(f"[fatal] {e}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         registry = SourceRegistry(
@@ -317,14 +389,22 @@ def main() -> None:
         print(f"[fatal] sources.yaml: {e}", file=sys.stderr)
         sys.exit(1)
 
+    host_label = (
+        cfg["ollama_host"] if backend.name == "ollama"
+        else cfg["llamacpp_host"]
+    )
     print(BANNER_TEMPLATE.format(
+        backend=backend.name,
         model=cfg["model"],
-        host=cfg["ollama_host"],
+        host=host_label,
         num_ctx=cfg["num_ctx"],
         num_predict=cfg["num_predict"],
         keep_alive=cfg["keep_alive"],
         sources=len(registry.list()),
     ))
+
+    # Информационная проверка, не блокирует REPL.
+    _backend_diagnose(backend, cfg)
 
     fs_policy = {
         "root": str(workspace),
@@ -348,9 +428,11 @@ def main() -> None:
 
     audit_path = (BASE_DIR / cfg["audit_path"]).resolve()
     audit = AuditLog(str(audit_path))
-    audit.write("session_start", model=cfg["model"])
+    audit.write("session_start",
+                model=cfg["model"],
+                backend=backend.name)
 
-    agent = HarnessAgent(cfg, guard, proxy, audit)
+    agent = HarnessAgent(cfg, guard, proxy, audit, backend=backend)
 
     while True:
         try:
@@ -364,7 +446,8 @@ def main() -> None:
         if user_input in ("/quit", "/exit"):
             break
         if user_input == "/reset":
-            agent = HarnessAgent(cfg, guard, proxy, audit)
+            agent = HarnessAgent(cfg, guard, proxy, audit,
+                                  backend=backend)
             print("[session reset]")
             continue
 

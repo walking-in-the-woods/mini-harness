@@ -1,6 +1,7 @@
 # Документация mini-harness
 
 - [Обзор](index.md) — что это и для кого
+- [Бэкенды инференса](backends.md) — Ollama и llama.cpp: переключение, различия, диагностика
 - [Архитектура](architecture.md) — как устроено
 - [Использование](usage.md) — REPL, workspace, подтверждения
 - [Политики доступа](policies.md) — whitelist, blacklist, writable, ext_allow_paths
