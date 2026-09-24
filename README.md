@@ -77,6 +77,26 @@
 - `/quit` — выход
 - `/reset` — новая сессия
 
+## Запуск моделей
+
+Для Ollama — `ollama serve` + `ollama pull <model>`.
+
+Для llama.cpp — единый скрипт `scripts/llama-server.sh`:
+
+```bash
+# Запустить модель и переключить .env одной командой
+scripts/llama-server.sh use 4b
+
+# Список моделей и портов
+scripts/llama-server.sh list
+
+# Остановить
+scripts/llama-server.sh stop 4b
+```
+
+Полная инструкция, таблица моделей, автоматический выбор порта и
+полный цикл batch-проверки — в [scripts/README.md](scripts/README.md).
+
 ## Настройка
 
 Все скалярные параметры — в `.env`. Политики путей и маршруты
