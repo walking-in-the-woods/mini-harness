@@ -406,6 +406,12 @@ def _handle_batch_command(user_input: str, agent: HarnessAgent,
     prompt_path = positional[2]
     target_dir = positional[3] if len(positional) == 4 else None
 
+    if chunk_enabled:
+        print("[i] chunked mode: каждый результат сохраняется в "
+              "<target>.parts/ по мере обработки. При сбое системы "
+              "parts останутся — можно посмотреть промежуточные "
+              "результаты. Перед запуском проверьте `free -h`.")
+
     runner = BatchRunner(
         agent, guard, workspace, audit,
         target_dir=target_dir,

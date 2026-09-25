@@ -10,8 +10,10 @@ Batch-обработка коллекции файлов одним prompt-фа�
 
 * Chunked (--chunk + --mode=code|docs). Файл разбивается на чанки
   через harness.processing. Каждый чанк трансформируется отдельно,
-  результаты собираются через Processor.merge, merged проверяется
-  через Processor.validate.
+  результат сразу пишется в <target>.parts/chunk_NNN.txt, чтобы
+  при сбое системы не потерять уже отработанное. Merge читает
+  parts с диска, склеивает, validates. При успешном apply parts
+  удаляются.
 
 Структурная валидация non-chunked:
 
@@ -28,6 +30,7 @@ import ast
 import logging
 import re
 import secrets
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -527,6 +530,20 @@ class BatchRunner:
         prompt_content: str,
         t0: float,
     ) -> None:
+        # Parts-каталог: сюда пишем каждый результат сразу после
+        # получения. Если система упадёт между чанками — эти файлы
+        # останутся, и можно посмотреть/возобновить. При успехе
+        # удаляются в _apply_items.
+        parts_dir_rel = item.target_rel + ".parts"
+        parts_dir_abs = self.workspace / parts_dir_rel
+        try:
+            parts_dir_abs.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            item.status = "failed"
+            item.error = f"cannot create {parts_dir_rel}: {e}"
+            item.duration_s = time.monotonic() - t0
+            return
+
         try:
             processor = get_processor(
                 self.mode, self.processing_config,
@@ -554,12 +571,15 @@ class BatchRunner:
             mode=self.mode,
             budget_bytes=self._budget_bytes,
             chunks_total=len(chunks),
+            parts_dir=parts_dir_rel,
         )
         for issue in split_issues:
             print(f"    [i] split: {issue.message}",
                   file=sys.stderr, flush=True)
 
-        outputs: list[str | None] = []
+        # outputs_paths[i] — Path к успешному parts-файлу или None.
+        # Самих строк outputs в памяти не держим — сразу пишем.
+        outputs_paths: list[Path | None] = []
         insufficient_marker = (
             self.processing_config.defaults.insufficient_context_marker
         )
@@ -579,15 +599,29 @@ class BatchRunner:
 
             chunk_seconds = time.monotonic() - chunk_t0
 
+            # Провал чанка.
             if error or result is None:
                 reason = error or "empty result"
-                outputs.append(None)
+                outputs_paths.append(None)
                 item.chunks_failed += 1
                 item.failed_chunks.append(FailedChunk(
                     index=chunk.index, kind=chunk.kind,
                     source_text=chunk.text, output=None,
                     error=reason, start=chunk.start, end=chunk.end,
                 ))
+                # Сохранить причину рядом с parts для разбора.
+                err_path = parts_dir_abs / (
+                    f"chunk_{chunk.index:03d}_error.txt"
+                )
+                try:
+                    err_path.write_text(
+                        f"kind: {chunk.kind}\n"
+                        f"index: {chunk.index}/{chunk.total}\n"
+                        f"error: {reason}\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
                 self.audit.write(
                     "batch_chunk_failed",
                     source=item.source_rel,
@@ -607,14 +641,14 @@ class BatchRunner:
                     break
                 continue
 
-            # Проверка на честный отказ модели.
+            # INSUFFICIENT_CONTEXT.
             stripped = result.strip()
             if (insufficient_marker and stripped == insufficient_marker):
                 on_insuff = (
                     self.processing_config.defaults.on_insufficient_context
                 )
                 if on_insuff == "fail":
-                    outputs.append(None)
+                    outputs_paths.append(None)
                     item.chunks_failed += 1
                     item.failed_chunks.append(FailedChunk(
                         index=chunk.index, kind=chunk.kind,
@@ -637,8 +671,18 @@ class BatchRunner:
                         break
                     continue
                 else:
-                    # skip
-                    outputs.append(chunk.text)
+                    # skip — сохраняем оригинал как parts-файл,
+                    # merge потом подставит его.
+                    skip_path = parts_dir_abs / (
+                        f"chunk_{chunk.index:03d}_skipped.txt"
+                    )
+                    try:
+                        skip_path.write_text(
+                            chunk.text, encoding="utf-8",
+                        )
+                    except OSError:
+                        pass
+                    outputs_paths.append(skip_path)
                     item.chunks_skipped += 1
                     print(f"    [i] chunk {chunk.index}/{chunk.total} "
                           f"[{chunk.kind}]: INSUFFICIENT_CONTEXT "
@@ -651,27 +695,42 @@ class BatchRunner:
                     )
                     continue
 
-            outputs.append(result)
+            # Успех — сразу пишем в parts.
+            out_path = parts_dir_abs / (
+                f"chunk_{chunk.index:03d}.txt"
+            )
+            try:
+                out_path.write_text(result, encoding="utf-8")
+            except OSError as e:
+                item.status = "failed"
+                item.error = f"cannot write {out_path.name}: {e}"
+                item.duration_s = time.monotonic() - t0
+                return
+
+            # result больше не нужен в памяти — пусть GC соберёт.
+            result = None
+
+            outputs_paths.append(out_path)
             item.chunks_ok += 1
             self.audit.write(
                 "batch_chunk_ok",
                 source=item.source_rel,
                 index=chunk.index,
                 kind=chunk.kind,
-                bytes=len(result.encode("utf-8")),
+                bytes=out_path.stat().st_size,
                 seconds=round(chunk_seconds, 2),
             )
             print(f"    [*] chunk {chunk.index}/{chunk.total} "
-                  f"[{chunk.kind}] ok, {len(result)} chars, "
+                  f"[{chunk.kind}] ok, {out_path.stat().st_size} bytes, "
                   f"{chunk_seconds:.1f}s",
                   file=sys.stderr, flush=True)
 
         item.duration_s = time.monotonic() - t0
 
-        # Если прервались раньше — дозаполнить outputs=None.
-        while len(outputs) < len(chunks):
-            remaining = chunks[len(outputs)]
-            outputs.append(None)
+        # Дозаполнить outputs_paths=None, если прервались раньше.
+        while len(outputs_paths) < len(chunks):
+            remaining = chunks[len(outputs_paths)]
+            outputs_paths.append(None)
             item.chunks_failed += 1
             item.failed_chunks.append(FailedChunk(
                 index=remaining.index, kind=remaining.kind,
@@ -680,24 +739,42 @@ class BatchRunner:
                 start=remaining.start, end=remaining.end,
             ))
 
-        # Если был fail — выходим.
+        # Если был fail при on_chunk_failure=fail — выходим,
+        # parts оставляем.
         if (item.chunks_failed > 0
                 and self.processing_config.defaults.on_chunk_failure
                 == "fail"):
             item.status = "failed"
             item.error = (
                 f"{item.chunks_failed}/{item.chunks_total} "
-                f"chunks failed"
+                f"chunks failed. Parts: {parts_dir_rel}/"
             )
             return
 
-        # Merge.
+        # Merge — читаем parts в память только на момент merge.
+        # После merge список outputs освобождается.
+        outputs: list[str | None] = []
+        try:
+            for p in outputs_paths:
+                if p is None:
+                    outputs.append(None)
+                else:
+                    outputs.append(p.read_text(encoding="utf-8"))
+        except OSError as e:
+            item.status = "failed"
+            item.error = f"read parts: {e}"
+            return
+
         try:
             merged = processor.merge(source_content, chunks, outputs)
         except ProcessError as e:
             item.status = "failed"
             item.error = f"merge: {e}"
             return
+        finally:
+            # Освободить outputs из памяти (merged уже собран).
+            outputs.clear()
+            del outputs
 
         # Validate.
         try:
@@ -1012,6 +1089,17 @@ class BatchRunner:
                                  reason=str(e))
                 errors += 1
                 continue
+
+            # Успешно записан — parts больше не нужны.
+            # Проваленные chunks (partial) остаются в <target>.failed/,
+            # их формирует _write_failed_chunks ниже.
+            parts_dir_rel = item.target_rel + ".parts"
+            parts_dir_abs = self.workspace / parts_dir_rel
+            if parts_dir_abs.is_dir():
+                try:
+                    shutil.rmtree(parts_dir_abs)
+                except OSError as e:
+                    print(f"  [i] не удалил {parts_dir_rel}: {e}")
 
             # Partial-режим: записать failed-чанки в <target>.failed/.
             if item.failed_chunks:

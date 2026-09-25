@@ -42,9 +42,13 @@ PORT_SCAN_RANGE="${PORT_SCAN_RANGE:-10}"
 #   jinja   встроенный Jinja-шаблон из GGUF (Qwen3 — /no_think, tools)
 #   chatml  generic chatml (Qwen2.5-Coder — стабильнее, чем jinja)
 #   none    без явного шаблона
+#
+# ctx-size: подбирается под RAM. 3B/4B — 4096/2048, 7B — 2048.
+# Для 4B снижено до 2048: KV-cache ~500 МБ вместо ~1 ГБ, качество
+# на chunked-задачах не страдает, а RAM экономится.
 MODELS=(
   "3b|qwen2.5-coder-3b-instruct-q4_k_m.gguf|8080|4096|chatml|Qwen2.5-Coder 3B Q4_K_M — быстрая"
-  "4b|Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|4096|jinja|Qwen3-4B-Instruct-2507 Q4_K_M — batch, /no_think"
+  "4b|Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|2048|jinja|Qwen3-4B-Instruct-2507 Q4_K_M — batch, /no_think"
   "7b|Qwen2.5-Coder-7B-Instruct-Q3_K_M.gguf|8082|2048|chatml|Qwen2.5-Coder 7B Q3_K_M — максимум качества"
 )
 
