@@ -10,13 +10,16 @@
   * llamacpp — прямой OpenAI-совместимый HTTP, адрес в
     LLAMACPP_HOST (обычно http://127.0.0.1:8080 или :8082).
 
+Chunked-обработка: config/processing.yaml — читается при старте,
+передаётся в BatchRunner. Опционален, отсутствие файла — дефолты.
+
 Команды пользователя (не модели):
   /sources                     список источников
   /tree <name> [subpath]       дерево -> input/_tree_<name>.md
   /files <name> [subpath]      плоский список -> input/_files_<name>.md
   /dump <name> [subpath]       содержимое -> input/_dump_<name>.md
   /reload                      перечитать sources.yaml
-  /batch <src> <glob> <prompt> [<target>]
+  /batch <src> <glob> <prompt> [<target>] [--mode=code|docs] [--chunk]
                                пакетная обработка директории
 """
 
@@ -34,6 +37,13 @@ from harness.backends import BackendError, ChatBackend, build_backend
 from harness.batch import BatchRunner
 from harness.confirm import ConfirmSession
 from harness.fs_guard import FileSystemGuard
+from harness.processing import (
+    ProcessError,
+    ProcessingConfigError,
+)
+from harness.processing import (
+    load as load_processing_config,
+)
 from harness.proxy import ApiProxy
 from harness.sources import SourceError, SourceRegistry
 
@@ -61,6 +71,22 @@ BANNER_TEMPLATE = """
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
+PROCESSING_CONFIG_PATH = BASE_DIR / "config" / "processing.yaml"
+
+
+# Разрешённые значения override-флагов /batch.
+_ALLOWED_OVERRIDES: dict[str, frozenset[str]] = {
+    "on_chunk_failure": frozenset({"fail", "partial"}),
+    "on_merge_invalid": frozenset({"fail", "partial"}),
+    "on_insufficient_context": frozenset({"fail", "skip"}),
+}
+
+# Человекочитаемые имена для сообщений об ошибках.
+_OVERRIDE_FLAG_NAMES: dict[str, str] = {
+    "on_chunk_failure": "--on-failure",
+    "on_merge_invalid": "--on-merge-invalid",
+    "on_insufficient_context": "--on-insufficient-context",
+}
 
 
 def _load_env(path: Path) -> None:
@@ -146,6 +172,15 @@ def load_runtime_config() -> dict:
             print("[fatal] HARNESS_MODEL не задан в .env", file=sys.stderr)
             sys.exit(1)
 
+    # Chunked-обработка: конфиг опционален, отсутствие файла —
+    # дефолты. Ошибка загрузки — фатальна, пользователь должен
+    # увидеть её до запуска batch'а.
+    try:
+        processing_config = load_processing_config(PROCESSING_CONFIG_PATH)
+    except ProcessingConfigError as e:
+        print(f"[fatal] processing config: {e}", file=sys.stderr)
+        sys.exit(1)
+
     return {
         "backend": backend,
         "model": model,
@@ -183,6 +218,7 @@ def load_runtime_config() -> dict:
         "proxy_max_response": _env_int(
             "HARNESS_PROXY_MAX_RESPONSE_BYTES", 200_000
         ),
+        "processing": processing_config,
     }
 
 
@@ -287,41 +323,103 @@ def _handle_source_command(user_input: str, registry: SourceRegistry,
 
 def _handle_batch_command(user_input: str, agent: HarnessAgent,
                            guard: FileSystemGuard, workspace: Path,
-                           audit: AuditLog) -> bool:
+                           audit: AuditLog, cfg: dict) -> bool:
     """Обрабатывает /batch.
 
-    Формат: /batch <source_dir> <glob> <prompt_path> [<target_dir>]
+    Формат:
+        /batch <src> <glob> <prompt> [<target>]
+               [--mode=code|docs] [--chunk]
+               [--on-failure=fail|partial]
+               [--on-merge-invalid=fail|partial]
+               [--on-insufficient-context=fail|skip]
     """
     if not user_input.startswith("/batch"):
         return False
 
     if user_input == "/batch":
         print("[!] usage: /batch <source_dir> <glob> <prompt_path> "
-              "[<target_dir>]")
+              "[<target_dir>] [--mode=code|docs] [--chunk]")
         print("    пример: /batch input/batch '*.py' "
-              "input/prompts/add-docstrings-generic.md")
+              "input/prompts/add-docstrings.md --mode=code --chunk")
         return True
 
     rest = user_input[len("/batch"):].strip()
-    parts = rest.split()
-    if len(parts) < 3:
+    tokens = rest.split()
+
+    # Отделяем флаги от позиционных аргументов.
+    positional: list[str] = []
+    mode = ""
+    chunk_enabled = False
+    overrides: dict[str, str] = {}
+
+    for tok in tokens:
+        if tok == "--chunk":
+            chunk_enabled = True
+        elif tok.startswith("--mode="):
+            mode = tok[len("--mode="):].strip().lower()
+        elif tok.startswith("--on-failure="):
+            overrides["on_chunk_failure"] = (
+                tok[len("--on-failure="):].strip().lower()
+            )
+        elif tok.startswith("--on-merge-invalid="):
+            overrides["on_merge_invalid"] = (
+                tok[len("--on-merge-invalid="):].strip().lower()
+            )
+        elif tok.startswith("--on-insufficient-context="):
+            overrides["on_insufficient_context"] = (
+                tok[len("--on-insufficient-context="):].strip().lower()
+            )
+        elif tok.startswith("--"):
+            print(f"[!] неизвестный флаг: {tok}")
+            return True
+        else:
+            positional.append(tok)
+
+    # Валидация override-значений до создания runner'а.
+    for key, value in overrides.items():
+        allowed = _ALLOWED_OVERRIDES.get(key, frozenset())
+        if value not in allowed:
+            flag = _OVERRIDE_FLAG_NAMES.get(key, key)
+            print(f"[!] недопустимое значение {flag}={value}; "
+                  f"допустимо: {sorted(allowed)}")
+            return True
+
+    if len(positional) < 3:
         print("[!] нужно минимум 3 аргумента: "
               "<source_dir> <glob> <prompt_path>")
         return True
-    if len(parts) > 4:
-        print("[!] максимум 4 аргумента: "
+    if len(positional) > 4:
+        print("[!] максимум 4 позиционных аргумента: "
               "<source_dir> <glob> <prompt_path> [<target_dir>]")
         return True
 
-    source_dir = parts[0]
-    glob_pattern = parts[1].strip("'\"")
-    prompt_path = parts[2]
-    target_dir = parts[3] if len(parts) == 4 else None
+    if chunk_enabled and mode not in ("code", "docs"):
+        print("[!] --chunk требует --mode=code|docs")
+        return True
+    if mode and not chunk_enabled:
+        print("[i] --mode указан без --chunk, "
+              "работаю в non-chunked режиме")
+        mode = ""
 
-    runner = BatchRunner(agent, guard, workspace, audit,
-                          target_dir=target_dir)
+    source_dir = positional[0]
+    glob_pattern = positional[1].strip("'\"")
+    prompt_path = positional[2]
+    target_dir = positional[3] if len(positional) == 4 else None
+
+    runner = BatchRunner(
+        agent, guard, workspace, audit,
+        target_dir=target_dir,
+        mode=mode,
+        chunk_enabled=chunk_enabled,
+        processing_config=cfg.get("processing"),
+        overrides=overrides,
+    )
     try:
         runner.run(source_dir, glob_pattern, prompt_path)
+    except ProcessingConfigError as e:
+        print(f"[!] processing config: {e}")
+    except ProcessError as e:
+        print(f"[!] processing: {e}")
     except Exception as e:
         print(f"[!] batch failed: {type(e).__name__}: {e}")
     return True
@@ -334,8 +432,7 @@ def _backend_diagnose(backend: ChatBackend, cfg: dict) -> None:
 
     Печатает строку "[i] ..." если сервер не отвечает. Точная
     подсказка зависит от бэкенда: у ollama это "ollama serve
-    запущен?", у llama.cpp — "llama-server запущен и модели
-    подгружены через --load-mode mlock?".
+    запущен?", у llama.cpp — "llama-server запущен?".
     """
     try:
         ok = backend.health()
@@ -353,8 +450,8 @@ def _backend_diagnose(backend: ChatBackend, cfg: dict) -> None:
     elif backend.name == "llamacpp":
         host = cfg.get("llamacpp_host", "?")
         print(f"[i] llama-server не отвечает на {host}.")
-        print("    Запустите ./Desktop/run-coder3b.sh (порт 8080) "
-              "или run-coder7b.sh (порт 8082).")
+        print("    Запустите scripts/llama-server.sh <alias> "
+              "(3b, 4b, 7b).")
         print("    Проверьте в браузере: " + host + "/health")
     else:
         print(f"[i] Бэкенд {backend.name!r} не отвечает. "
@@ -454,7 +551,8 @@ def main() -> None:
         if _handle_source_command(user_input, registry, workspace):
             continue
 
-        if _handle_batch_command(user_input, agent, guard, workspace, audit):
+        if _handle_batch_command(user_input, agent, guard, workspace,
+                                  audit, cfg):
             continue
 
         try:

@@ -21,8 +21,12 @@ ollama по версиям pydantic).
    идёт ~2–4 t/s; ответ на 1024 токенов занимает 4–8 минут.
    30-секундный дефолт (как у ApiProxy) здесь неприемлем.
 
-5. Проверка health() — GET /health (специфично для llama-server,
-   а не OpenAI). Не блокирует, вызывается только из CLI/диагностики.
+5. /v1/models может отдавать два формата: OpenAI
+   {"object":"list","data":[{"id":...}]} и расширенный
+   {"models":[{"name":...}]} (свежие сборки). Обрабатываем оба.
+
+6. Health-check — GET /health (специфично для llama-server,
+   не OpenAI).
 """
 
 from __future__ import annotations
@@ -154,6 +158,10 @@ class LlamaCppBackend(ChatBackend):
             return False
 
     def list_models(self) -> list[str]:
+        """Список моделей. Обрабатывает оба формата ответа
+        llama-server: OpenAI ({"data":[{"id":...}]}) и расширенный
+        ({"models":[{"name":...}]}).
+        """
         try:
             with httpx.Client(timeout=5.0) as client:
                 r = client.get(f"{self.host}/v1/models",
@@ -162,11 +170,16 @@ class LlamaCppBackend(ChatBackend):
                 data = r.json()
         except Exception:
             return []
-        items = data.get("data") or []
+        if not isinstance(data, dict):
+            return []
+        items = data.get("data") or data.get("models") or []
+        if not isinstance(items, list):
+            return []
         result: list[str] = []
         for m in items:
-            if isinstance(m, dict):
-                mid = m.get("id") or ""
-                if mid:
-                    result.append(mid)
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id") or m.get("name") or m.get("model") or ""
+            if mid:
+                result.append(mid)
         return result

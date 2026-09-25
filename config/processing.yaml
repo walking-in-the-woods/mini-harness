@@ -1,0 +1,128 @@
+# Конфигурация chunked-режима для /batch.
+#
+# ВНИМАНИЕ: обычный (не-chunked) /batch этот файл не читает.
+# Файл опционален: если отсутствует — используются дефолты,
+# совпадающие с содержимым этого файла.
+#
+# Изменения подхватываются при старте ./run.sh.
+# Опечатки в именах ключей → fail-fast при загрузке с указанием
+# допустимых имён. Никаких «тихих» подстановок дефолтов.
+#
+# Формула расчёта бюджета чанка — в docs/processing.md.
+
+version: 1
+
+defaults:
+  # Целевой размер чанка в UTF-8 байтах.
+  # 0 = автоматически из HARNESS_NUM_CTX.
+  # Если > 0, применяется как есть, авто-формула игнорируется.
+  chunk_target_bytes: 0
+
+  # Жёсткий нижний предел чанка. Если граница даёт чанк меньше —
+  # слить со следующим. Защита от «чанков по 50 байт».
+  chunk_min_bytes: 800
+
+  # Множитель безопасности для авто-бюджета.
+  # 0.7 = использовать 70% от вычисленного бюджета.
+  # Меньше — консервативнее (крупнее модели, мельче чанки).
+  # Больше — агрессивнее (риск context overflow от llama-server).
+  # Тюнится эмпирически на конкретной модели: см. docs/processing.md.
+  budget_safety: 0.7
+
+  # Доля бюджета, зарезервированная под ответ модели.
+  # 0.4 = 40% от T_available уходит на output, 60% на input.
+  # При docstrings разумно; при переводе текста может быть иначе.
+  output_reserve_ratio: 0.4
+
+  # Overlap между соседними чанками в байтах.
+  # ВНИМАНИЕ: в текущей версии НЕ поддерживается.
+  # Значение > 0 вызывает ProcessError при создании DocProcessor.
+  # Поле оставлено для будущих версий (когда появится реализация).
+  overlap_bytes: 0
+
+  # Что делать, когда чанк не удалось обработать
+  # (model error, structure check failed, timeout).
+  #   fail    — прервать batch, ничего не писать
+  #   partial — писать успешные, провальные — в <target>.failed/.
+  #             ВНИМАНИЕ: в code-режиме частичный результат
+  #             требует ручной проверки. См. warning при загрузке.
+  on_chunk_failure: fail
+
+  # Что делать, когда merged-файл не прошёл валидацию.
+  #   fail    — прервать
+  #   partial — писать raw merge + отчёт в <target>.failed/
+  on_merge_invalid: fail
+
+  # Что делать, когда модель вывела INSUFFICIENT_CONTEXT.
+  #   fail — считать как провал чанка (жёсткая гарантия полной обработки)
+  #   skip — считать как явный пропуск
+  on_insufficient_context: fail
+
+  # Строка-маркер, которую модель должна вывести, если не может
+  # обработать чанк. Пустая строка = фича отключена.
+  insufficient_context_marker: "INSUFFICIENT_CONTEXT"
+
+code:
+  # Расширения, для которых применим code-режим.
+  extensions: [.py, .pyw]
+
+  # AST-узлы, по которым режем на чанки.
+  # Один top-level def/class = один чанк.
+  boundary_nodes:
+    - FunctionDef
+    - AsyncFunctionDef
+    - ClassDef
+
+  # Включать импорты и module-level assignments как read-only
+  # preamble в каждый чанк. По умолчанию выключено: удваивает
+  # токены на входе.
+  include_preamble: false
+
+  # Максимальный размер preamble. Если импорты + глобалы больше —
+  # fail, не пытаться обрезать.
+  preamble_max_bytes: 2000
+
+  # Проверки, применяемые к merged-файлу.
+  #   ast_parseable              — merged парсится как Python
+  #   defs_preserved             — все имена из оригинала на месте
+  #   bodies_nonempty            — ни одна функция не пустая
+  #   signature_args_preserved   — имена аргументов не изменились
+  #   no_new_top_level           — WARN, если модель добавила def/class
+  validate:
+    - ast_parseable
+    - defs_preserved
+    - bodies_nonempty
+    - signature_args_preserved
+
+  # Стратегия merge.
+  #   replace_block — каждый чанк заменяет свой диапазон в оригинале
+  merge_strategy: replace_block
+
+  # Орнамент вокруг необработанных чанков при on_chunk_failure: partial.
+  # Модель увидит это как комментарий, если пользователь передаст файл
+  # обратно в batch или в guided mode. Для .py, .sh и подобных
+  # используется #; для прочих — тот же символ (безвредно).
+  partial_ornament_open:  "# ======== NOT PROCESSED: chunk {index}/{total} ========"
+  partial_ornament_close: "# ======== END NOT PROCESSED ========"
+
+docs:
+  # Расширения для docs-режима.
+  extensions: [.md, .mdx, .rst, .txt]
+
+  # Уровни заголовков, работающие как границы чанков.
+  # [1, 2] = резать на # и ##, ### и ниже остаются внутри чанка.
+  header_levels: [1, 2]
+
+  # Разделитель для paragraph-режима (когда заголовков нет).
+  paragraph_separator: '\n\s*\n'
+
+  # Стратегия merge.
+  #   concatenate — склеить выходы чанков по порядку
+  merge_strategy: concatenate
+
+  # Проверки merged-файла.
+  #   headers_preserved — все оригинальные заголовки на месте
+  #   fences_balanced   — число ``` чётное, открытие/закрытие парные
+  validate:
+    - headers_preserved
+    - fences_balanced

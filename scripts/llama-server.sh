@@ -22,24 +22,16 @@ LLAMA_DIR="${LLAMA_DIR:-$HOME/as-dev/llama.cpp}"
 SERVER_BIN="$LLAMA_DIR/build/bin/llama-server"
 MODELS_DIR="$LLAMA_DIR/models"
 
-# Директория проекта mini-harness (родитель scripts/).
 MINI_HARNESS_DIR="${MINI_HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ENV_FILE="$MINI_HARNESS_DIR/.env"
 
-# Куда писать PID, порт и лог фоновых серверов.
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/llama-server"
 mkdir -p "$STATE_DIR"
 LOG_DIR="$STATE_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# Таймаут ожидания health-эндпоинта (секунды). 4B Q4 с --load-mode
-# mlock стартует 15-25 с; 7B Q3 — 30-40 с.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
-
-# Открывать Web UI в браузере после старта (true/false).
 OPEN_BROWSER="${OPEN_BROWSER:-true}"
-
-# Диапазон портов для fallback, если базовый порт занят.
 PORT_SCAN_RANGE="${PORT_SCAN_RANGE:-10}"
 
 # ── ТАБЛИЦА МОДЕЛЕЙ ───────────────────────────────────────────────────────
@@ -50,10 +42,6 @@ PORT_SCAN_RANGE="${PORT_SCAN_RANGE:-10}"
 #   jinja   встроенный Jinja-шаблон из GGUF (Qwen3 — /no_think, tools)
 #   chatml  generic chatml (Qwen2.5-Coder — стабильнее, чем jinja)
 #   none    без явного шаблона
-#
-# base_port — предпочтительный порт. Если занят, скрипт возьмёт
-# следующий свободный в диапазоне [base_port, base_port+PORT_SCAN_RANGE].
-# Фактический порт сохраняется и используется командой `use`.
 MODELS=(
   "3b|qwen2.5-coder-3b-instruct-q4_k_m.gguf|8080|4096|chatml|Qwen2.5-Coder 3B Q4_K_M — быстрая"
   "4b|Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|4096|jinja|Qwen3-4B-Instruct-2507 Q4_K_M — batch, /no_think"
@@ -82,7 +70,6 @@ pid_file()  { echo "$STATE_DIR/$1.pid";  }
 port_file() { echo "$STATE_DIR/$1.port"; }
 log_file()  { echo "$LOG_DIR/$1.log";    }
 
-# PID живого процесса для alias, или ничего.
 running_pid() {
     local alias="$1" pf pid
     pf="$(pid_file "$alias")"
@@ -96,7 +83,6 @@ running_pid() {
     echo "$pid"
 }
 
-# Фактический порт: если сервер запущен — из port_file; иначе base_port.
 actual_port_of() {
     local alias="$1" pf row base
     pf="$(port_file "$alias")"
@@ -120,7 +106,6 @@ port_in_use() {
     fi
 }
 
-# Первый свободный порт в диапазоне [base, base+range].
 find_free_port() {
     local base="$1" range="${2:-$PORT_SCAN_RANGE}" p
     for ((p = base; p <= base + range; p++)); do
@@ -147,18 +132,15 @@ wait_for_health() {
     echo; die "таймаут ${timeout} с — сервер не ответил на $url"
 }
 
-# Обновить ключ в .env. Если строки нет — добавить в конец.
 set_env() {
     local key="$1" value="$2" file="$3"
     if grep -q "^${key}=" "$file"; then
-        # sed с разделителем | — value не должен содержать |
         sed -i "s|^${key}=.*|${key}=${value}|" "$file"
     else
         printf '\n%s=%s\n' "$key" "$value" >> "$file"
     fi
 }
 
-# Подготовка аргументов chat-template.
 chat_args_for() {
     local chat="$1"
     case "$chat" in
@@ -169,8 +151,6 @@ chat_args_for() {
     esac
 }
 
-# Запуск сервера. Возвращает PID через глобальную LAST_PID.
-# Аргумент $1=alias, $2=foreground|background.
 spawn_server() {
     local alias="$1" mode="$2"
     local row
@@ -181,7 +161,6 @@ spawn_server() {
     [[ -f "$model_path" ]] || die "файл не найден: $model_path"
     [[ -x "$SERVER_BIN" ]] || die "llama-server не найден: $SERVER_BIN"
 
-    # Найти свободный порт, начиная с base_port.
     local port
     port="$(find_free_port "$base_port")" \
         || die "нет свободного порта в диапазоне $base_port..$((base_port+PORT_SCAN_RANGE))"
@@ -189,7 +168,7 @@ spawn_server() {
         info "порт $base_port занят, использую $port"
     fi
 
-    # shellcheck disable=SC2206  # splat по словам — это желаемое поведение
+    # shellcheck disable=SC2206
     local chat_args=( $(chat_args_for "$chat") )
 
     info "Запускаю $alias ($desc)"
@@ -286,7 +265,6 @@ cmd_foreground() {
     ok "Health: curl -sf http://127.0.0.1:$(actual_port_of "$alias")/health"
     echo
 
-    # Trap для корректного завершения по Ctrl+C
     trap 'echo; info "Останавливаю $alias (PID $LAST_PID)"; kill "$LAST_PID" 2>/dev/null; rm -f "$(pid_file "$alias")" "$(port_file "$alias")"; ok "Готово."' EXIT INT TERM
     wait "$LAST_PID"
 }
@@ -392,8 +370,6 @@ LLAMACPP_HOST=http://127.0.0.1:$port
 HARNESS_NUM_CTX=$ctx
 EOF
 }
-
-# ── MAIN ──────────────────────────────────────────────────────────────────
 
 usage() {
     cat <<EOF

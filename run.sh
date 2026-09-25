@@ -92,8 +92,8 @@ if [[ "$BACKEND" == "llamacpp" || "$BACKEND" == "llama.cpp" || \
     if command -v curl >/dev/null 2>&1; then
         if ! curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
             echo "[i] llama-server не отвечает на ${HOST}."
-            echo "    Запустите ~/Desktop/run-coder3b.sh (порт 8080)"
-            echo "    или run-coder7b.sh (порт 8082)."
+            echo "    Запустите scripts/llama-server.sh <alias>"
+            echo "    (aliases: 3b, 4b, 7b)."
         fi
     fi
 else

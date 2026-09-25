@@ -67,7 +67,6 @@ from typing import Any
 
 from harness.audit import AuditLog
 from harness.backends import (
-    BackendError,
     ChatBackend,
     OllamaBackend,
     build_backend,

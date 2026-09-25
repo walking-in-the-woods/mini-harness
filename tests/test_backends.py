@@ -26,9 +26,9 @@ from harness.backends import (
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # build_backend
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def test_build_backend_default_is_ollama():
     backend = build_backend({"ollama_host": "http://127.0.0.1:11434"})
@@ -84,9 +84,9 @@ def test_build_backend_llamacpp_passes_timeout_and_key():
     assert backend.timeout == 42.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # OllamaBackend
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 class _ScriptedOllamaClient:
     """Мок ollama.Client. Записывает все вызовы chat()."""
@@ -210,9 +210,9 @@ def test_ollama_backend_list_models_empty_on_error():
     assert backend.list_models() == []
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # LlamaCppBackend: конструктор
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def test_llamacpp_trailing_slash_stripped():
     b = LlamaCppBackend("http://127.0.0.1:8080/")
@@ -229,9 +229,9 @@ def test_llamacpp_name():
     assert b.name == "llamacpp"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # LlamaCppBackend: _normalize_response
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def test_normalize_response_no_tool_calls():
     data = {"choices": [{"message": {"content": "hello"}}]}
@@ -337,9 +337,9 @@ def test_normalize_response_accepts_dataclass_shaped_dict():
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # LlamaCppBackend: chat, health, list_models через мок httpx.Client
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 @pytest.fixture
 def fake_http(monkeypatch):
@@ -509,15 +509,34 @@ def test_llamacpp_health_false_on_network_error(monkeypatch):
     assert backend.health() is False
 
 
-def test_llamacpp_list_models(fake_http):
-    fake_http["response"] = (200, {"data": [
-        {"id": "qwen-coder-3b"},
-        {"id": "qwen-coder-7b"},
-        {"not_id": "x"},     # пропускается
-        "junk",              # пропускается
-    ]})
+def test_llamacpp_list_models_openai_format(fake_http):
+    """OpenAI-формат: {"object": "list", "data": [{"id": ...}]}."""
+    fake_http["response"] = (200, {
+        "object": "list",
+        "data": [
+            {"id": "qwen-coder-3b", "object": "model"},
+            {"id": "qwen-coder-7b", "object": "model"},
+            {"not_id": "x"},     # пропускается
+            "junk",              # пропускается
+        ],
+    })
     backend = LlamaCppBackend("http://127.0.0.1:8080")
     assert backend.list_models() == ["qwen-coder-3b", "qwen-coder-7b"]
+
+
+def test_llamacpp_list_models_extended_format(fake_http):
+    """Расширенный формат свежего llama-server:
+    {"models": [{"name": "/path/to/model.gguf"}]}."""
+    fake_http["response"] = (200, {
+        "models": [
+            {"name": "/home/as/models/qwen3.gguf",
+             "model": "/home/as/models/qwen3.gguf"},
+        ],
+    })
+    backend = LlamaCppBackend("http://127.0.0.1:8080")
+    assert backend.list_models() == [
+        "/home/as/models/qwen3.gguf"
+    ]
 
 
 def test_llamacpp_list_models_empty_on_error(fake_http):

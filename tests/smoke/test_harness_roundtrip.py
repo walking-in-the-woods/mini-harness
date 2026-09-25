@@ -5,6 +5,10 @@
 Smoke обращается к серверу инференса напрямую через OLLAMA_HOST.
 HarnessAgent получает client= явно — конфигурация mTLS в mini
 не нужна.
+
+_check_backend_alive: отличает «модель слабая» (xfail) от
+«сервер недоступен» (fail). Смешивать их нельзя — xfail маскирует
+инфраструктурные проблемы.
 """
 
 from __future__ import annotations
@@ -27,8 +31,17 @@ TOOL_CAPABLE = os.environ.get(
     "SMOKE_TOOL_CAPABLE", "true"
 ).lower() == "true"
 
+# Таймаут round-trip с реальной моделью. 7B Q4 на N100 даёт 2–4 t/s;
+# один tool-call round-trip (tool_call + финальный ответ) занимает
+# 2–5 минут. Дефолтный timeout=60 из pytest.ini рассчитан на
+# юнит-тесты и здесь неприменим.
+SMOKE_TIMEOUT = int(os.environ.get("SMOKE_TIMEOUT", "900"))
 
-pytestmark = pytest.mark.smoke
+
+pytestmark = [
+    pytest.mark.smoke,
+    pytest.mark.timeout(SMOKE_TIMEOUT),
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -78,11 +91,21 @@ def agent(tmp_path: Path) -> HarnessAgent:
     return HarnessAgent(cfg, guard, proxy, audit, client=direct_client)
 
 
+def _check_backend_alive(result: dict, context: str) -> None:
+    """Если harness вернул [backend error] — это не «модель слабая»,
+    а «сервер недоступен». Такой тест должен падать (FAILED), а не
+    уходить в xfail: xfail маскирует инфраструктурные проблемы."""
+    text = result.get("text") or ""
+    if "[backend error]" in text or "[ollama error]" in text:
+        pytest.fail(f"{context}: backend unavailable — {text[:300]!r}")
+
+
 def test_read_file_via_tool_call(agent: HarnessAgent):
     result = agent.run(
         "Read the file hello.txt and tell me exactly what is inside it. "
         "The file content is a short ASCII string."
     )
+    _check_backend_alive(result, "read_file round-trip")
     if "PONG-42" in result["text"]:
         return
     pytest.xfail(
@@ -95,6 +118,7 @@ def test_propose_write_via_tool_call(agent: HarnessAgent):
         "Create a file notes/smoke.txt containing exactly the text "
         "'OK-HARNESS'. Use the propose_write tool."
     )
+    _check_backend_alive(result, "propose_write round-trip")
     pending = result["pending_writes"]
     if not pending:
         pytest.xfail(

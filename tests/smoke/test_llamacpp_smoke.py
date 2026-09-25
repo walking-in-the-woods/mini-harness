@@ -4,8 +4,8 @@
 а не падают: CI не должен требовать запущенный llama-server.
 
 Переменные окружения:
-  LLAMACPP_HOST        адрес сервера, например http://127.0.0.1:8080
-  SMOKE_LLAMACPP_MODEL метка модели (по умолчанию "llamacpp-local")
+  LLAMACPP_HOST           адрес сервера, например http://127.0.0.1:8080
+  SMOKE_LLAMACPP_MODEL    метка модели (по умолчанию "llamacpp-local")
   SMOKE_LLAMACPP_TIMEOUT  таймаут чата в секундах (по умолчанию 120)
 """
 
