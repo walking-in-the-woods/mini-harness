@@ -1,6 +1,8 @@
 """Capsule Formatter — компактная сериализация узлов и подграфов."""
 from __future__ import annotations
 
+import json
+
 from harness.atlas.config import AtlasConfig
 from harness.atlas.formatter.budget import enforce_budget
 from harness.atlas.security.sanitizer import Sanitizer
@@ -19,7 +21,6 @@ class CapsuleFormatter:
     def overview(self) -> str:
         stats = self.q.stats()
         gen = self.q.generation_hash() or "unknown"
-        # Топ-5 модулей по числу узлов
         rows = self.q.conn.execute(
             "SELECT path, COUNT(*) c FROM nodes "
             "WHERE kind != 'Module' GROUP BY path ORDER BY c DESC LIMIT 5"
@@ -28,7 +29,7 @@ class CapsuleFormatter:
             f"{self._short_path(p)}({c})" for p, c in rows
         ) or "(empty)"
         lines = [
-            f"project: atlas | stack: py",
+            "project: atlas | stack: py",
             f"files: {stats['files']} | nodes: {stats['nodes']} | edges: {stats['edges']}",
             f"top: {pkgs}",
             f"gen: {gen}",
@@ -45,15 +46,14 @@ class CapsuleFormatter:
             return "no matches"
         # Возвращаем qualified_name — именно его принимает card и
         # прочие операции. Раньше здесь был path::name, и модель,
-        # получив от search строку, не могла передать её в card:
-        # find_by_qualified_name её не находил, модель зацикливалась.
+        # получив от search строку, не могла передать её в card.
         lines = [r.qualified_name for r in rows]
         return enforce_budget("\n".join(lines), self.cfg.budget_search)
 
     # ---- card --------------------------------------------------------
 
     def card(self, node: NodeRow) -> str:
-        if node.kind == "Function" or node.kind == "Method":
+        if node.kind in ("Function", "Method"):
             body = self._card_function(node)
         elif node.kind == "Class":
             body = self._card_class(node)
@@ -76,6 +76,9 @@ class CapsuleFormatter:
         ]
         if names:
             lines.append("calls: " + ", ".join(names))
+        raises = self._extract_raises(node.contracts)
+        if raises:
+            lines.append("raises: " + ", ".join(raises[:5]))
         lines.append(f"gen: {node.generation_hash}")
         return "\n".join(lines)
 
@@ -100,7 +103,8 @@ class CapsuleFormatter:
     def _card_module(self, node: NodeRow) -> str:
         public = self.q.conn.execute(
             "SELECT name FROM nodes WHERE path=? "
-            "AND kind IN ('Class','Function') AND name NOT LIKE '\\_%' ESCAPE '\\' "
+            "AND kind IN ('Class','Function','Constant') "
+            "AND name NOT LIKE '\\_%' ESCAPE '\\' "
             "ORDER BY name LIMIT 10",
             (node.path,),
         ).fetchall()
@@ -126,6 +130,23 @@ class CapsuleFormatter:
             )
         lines.append(f"gen: {node.generation_hash}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_raises(contracts_json: str | None) -> list[str]:
+        """Извлечь список raises из JSON-контрактов. Пустой список при
+        отсутствии/невалидности."""
+        if not contracts_json:
+            return []
+        try:
+            data = json.loads(contracts_json)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        raises = data.get("raises") or []
+        if not isinstance(raises, list):
+            return []
+        return [str(r) for r in raises if isinstance(r, str)]
 
     # ---- callers / callees -------------------------------------------
 
@@ -170,7 +191,6 @@ class CapsuleFormatter:
     # ---- impact ------------------------------------------------------
 
     def impact(self, node: NodeRow) -> str:
-        """Обратное замыкание по calls до глубины max_depth (≤10 узлов)."""
         seen: set[str] = set()
         frontier: list[tuple[str, int]] = [(node.id, 0)]
         result: list[tuple[str, int, dict]] = []

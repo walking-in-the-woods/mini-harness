@@ -3,19 +3,22 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 @dataclass
 class RawNode:
-    kind: str                # Module | Class | Function | Method | Import | Decorator
+    kind: str                # Module | Class | Function | Method | Import | Decorator | Constant
     name: str
     qualified_name: str
-    path: str                # ← РЕАЛЬНЫЙ путь файла, не производная от qname
+    path: str                # реальный путь файла
     start_line: int
     end_line: int
     summary: str | None = None
+    contracts: str | None = None   # JSON: {"args": [...], "returns": "...", "raises": [...]}
 
 
 @dataclass
@@ -49,6 +52,91 @@ def _first_line_docstring(node: ast.AST) -> str | None:
     return first or None
 
 
+# ── Контракты из docstring ────────────────────────────────────────────────
+
+_ARGS_HEADERS = {"Args:", "Arguments:", "Parameters:"}
+_RETURNS_HEADERS = {"Returns:", "Return:", "Yields:"}
+_RAISES_HEADERS = {"Raises:", "Exceptions:"}
+
+_ARG_NAME_RE = re.compile(r"^([A-Za-z_]\w*)\s*[:(]")
+
+
+def _extract_block_names(doc: str, headers: set[str]) -> list[str]:
+    """Извлечь имена из блока Args: / Raises:.
+
+    Google-style: после заголовка идёт список строк с большим
+    отступом, каждая вида `name (type): описание` или `name: описание`.
+    Пустая строка или строка с меньшим отступом — конец блока.
+    """
+    lines = doc.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() not in headers:
+            continue
+        base_indent = len(line) - len(line.lstrip())
+        names: list[str] = []
+        for j in range(i + 1, len(lines)):
+            ln = lines[j]
+            if not ln.strip():
+                break
+            indent = len(ln) - len(ln.lstrip())
+            if indent <= base_indent:
+                break
+            m = _ARG_NAME_RE.match(ln.strip())
+            if m:
+                names.append(m.group(1))
+        return names
+    return []
+
+
+def _extract_returns(doc: str) -> str | None:
+    """Извлечь первую строку из блока Returns:.
+
+    Возвращает текст первой непустой строки блока (обрезается до
+    60 символов), либо None.
+    """
+    lines = doc.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() not in _RETURNS_HEADERS:
+            continue
+        base_indent = len(line) - len(line.lstrip())
+        for j in range(i + 1, len(lines)):
+            ln = lines[j]
+            if not ln.strip():
+                continue
+            indent = len(ln) - len(ln.lstrip())
+            if indent <= base_indent:
+                break
+            return ln.strip()[:60]
+        return None
+    return None
+
+
+def _extract_contracts(node: ast.AST) -> str | None:
+    """JSON-строка контрактов из docstring, либо None.
+
+    Формат: {"args": ["a", "b"], "returns": "int", "raises": ["ValueError"]}.
+    Пустые списки/строки опускаются. Если все три пусты — None.
+    """
+    doc = ast.get_docstring(node, clean=True)
+    if not doc:
+        return None
+    args = _extract_block_names(doc, _ARGS_HEADERS)
+    returns = _extract_returns(doc)
+    raises = _extract_block_names(doc, _RAISES_HEADERS)
+    if not (args or returns or raises):
+        return None
+    payload: dict[str, object] = {}
+    if args:
+        payload["args"] = args
+    if returns:
+        payload["returns"] = returns
+    if raises:
+        payload["raises"] = raises
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# ── Парсер ────────────────────────────────────────────────────────────────
+
 class PythonAstParser:
     """Парсер одного .py-файла в RawNode/RawEdge."""
 
@@ -59,9 +147,7 @@ class PythonAstParser:
             return ParseResult(error=f"syntax error at line {e.lineno}: {e.msg}")
 
         result = ParseResult()
-        # Qualified name модуля: путь без .py, / → ::
         module_qname = path.removesuffix(".py").replace("/", "::")
-        # Реальный путь файла — прокидывается во все узлы этого файла.
         file_path = path
 
         result.nodes.append(RawNode(
@@ -84,6 +170,51 @@ class PythonAstParser:
                 if node.module:
                     self._add_import(result, module_qname, file_path,
                                      node.module, node.lineno)
+
+        # Константы (top-level NAME = <literal>)
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                # NAME = value (одиночный target)
+                if (len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and isinstance(node.value, ast.Constant)):
+                    self._add_constant(
+                        result, module_qname, file_path,
+                        node.targets[0].id, node,
+                    )
+            elif isinstance(node, ast.AnnAssign):
+                # NAME: type = value
+                if (isinstance(node.target, ast.Name)
+                        and node.value is not None
+                        and isinstance(node.value, ast.Constant)):
+                    self._add_constant(
+                        result, module_qname, file_path,
+                        node.target.id, node,
+                    )
+
+        # Уникальные декораторы в файле — по одному узлу на имя.
+        # Собираем до обхода, чтобы _add_function/_add_class могли
+        # ссылаться на qname узла Decorator.
+        decorator_names: set[str] = set()
+        for node in ast.walk(tree):
+            for dec in getattr(node, "decorator_list", []):
+                name = _dotted_name(dec)
+                if name:
+                    decorator_names.add(name)
+
+        for name in sorted(decorator_names):
+            dec_qname = f"{module_qname}::{name}"
+            # start/end — грубо: строка объявления первой встреченной
+            # функции с этим декоратором не нужна; ставим 0/0.
+            result.nodes.append(RawNode(
+                kind="Decorator",
+                name=name.split(".")[-1],
+                qualified_name=dec_qname,
+                path=file_path,
+                start_line=0,
+                end_line=0,
+                summary=None,
+            ))
 
         # Top-level: классы, функции
         for node in tree.body:
@@ -118,6 +249,27 @@ class PythonAstParser:
             reason="import-binding",
         ))
 
+    def _add_constant(self, result: ParseResult, module_qname: str,
+                      file_path: str, name: str,
+                      node: ast.Assign | ast.AnnAssign) -> None:
+        qname = f"{module_qname}::{name}"
+        end_line = getattr(node, "end_lineno", node.lineno) or node.lineno
+        result.nodes.append(RawNode(
+            kind="Constant",
+            name=name,
+            qualified_name=qname,
+            path=file_path,
+            start_line=node.lineno,
+            end_line=end_line,
+            summary=None,
+        ))
+        result.edges.append(RawEdge(
+            src_qualified=module_qname,
+            kind="contains",
+            target_name=qname,
+            line=node.lineno,
+        ))
+
     def _add_class(self, result: ParseResult, parent_qname: str,
                    file_path: str, node: ast.ClassDef) -> None:
         qname = f"{parent_qname}::{node.name}"
@@ -129,6 +281,7 @@ class PythonAstParser:
             start_line=node.lineno,
             end_line=node.end_lineno or node.lineno,
             summary=_first_line_docstring(node),
+            contracts=None,
         ))
         result.edges.append(RawEdge(
             src_qualified=parent_qname,
@@ -161,6 +314,7 @@ class PythonAstParser:
                       node: ast.FunctionDef | ast.AsyncFunctionDef,
                       kind: str) -> None:
         qname = f"{parent_qname}::{node.name}"
+        module_qname = file_path.removesuffix(".py").replace("/", "::")
         result.nodes.append(RawNode(
             kind=kind,
             name=node.name,
@@ -169,6 +323,7 @@ class PythonAstParser:
             start_line=node.lineno,
             end_line=node.end_lineno or node.lineno,
             summary=_first_line_docstring(node),
+            contracts=_extract_contracts(node),
         ))
         result.edges.append(RawEdge(
             src_qualified=parent_qname,
@@ -180,10 +335,11 @@ class PythonAstParser:
         for dec in node.decorator_list:
             dec_name = _dotted_name(dec)
             if dec_name:
+                # target — qname узла Decorator в этом же файле
                 result.edges.append(RawEdge(
                     src_qualified=qname,
                     kind="decorates",
-                    target_name=dec_name,
+                    target_name=f"{module_qname}::{dec_name}",
                     line=getattr(dec, "lineno", node.lineno),
                 ))
 

@@ -95,9 +95,6 @@ class LifecycleManager:
             raise RuntimeError(parse.error)
 
         with self.conn:  # транзакция на файл (ФТ-14)
-            # Удалить старые nodes/edges для этого path.
-            # edges.src_id имеет FK → nodes.id ON DELETE CASCADE,
-            # поэтому рёбра удаляются каскадом.
             self.conn.execute(
                 "DELETE FROM nodes WHERE path=?", (entry.rel_path,)
             )
@@ -114,9 +111,6 @@ class LifecycleManager:
                 ),
             )
 
-            # Все узлы этого файла — с реальным entry.rel_path.
-            # python_ast теперь кладёт в RawNode.path именно его,
-            # поэтому FK nodes.path → files.path соблюдается.
             node_ids: dict[str, str] = {}
             for raw in parse.nodes:
                 nid = node_id(raw.path, raw.qualified_name)
@@ -124,19 +118,15 @@ class LifecycleManager:
                 self.conn.execute(
                     "INSERT OR REPLACE INTO nodes("
                     "id,kind,name,qualified_name,path,start_line,"
-                    "end_line,summary,generation_hash) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    "end_line,summary,contracts,generation_hash) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         nid, raw.kind, raw.name, raw.qualified_name,
                         raw.path, raw.start_line, raw.end_line,
-                        raw.summary, "pending",
+                        raw.summary, raw.contracts, "pending",
                     ),
                 )
 
-            # Рёбра: dst_id, если задан, всегда ссылается на узел,
-            # который уже есть в nodes (resolver ставит dst_id только
-            # после успешного _lookup_*). Поэтому FK edges.dst_id →
-            # nodes.id тоже соблюдается.
             by_src: dict[str, list[RawEdge]] = {}
             for e in parse.edges:
                 by_src.setdefault(e.src_qualified, []).append(e)
@@ -151,15 +141,15 @@ class LifecycleManager:
                 for r in resolved:
                     self.conn.execute(
                         "INSERT OR REPLACE INTO edges("
-                        "src_id,dst_id,kind,status,reason,line,"
-                        "generation_hash) VALUES(?,?,?,?,?,?,?)",
+                        "src_id,dst_id,kind,status,reason,line,via,"
+                        "generation_hash) VALUES(?,?,?,?,?,?,?,?)",
                         (
                             r.src_id, r.dst_id, r.kind, r.status,
-                            r.reason, r.line, "pending",
+                            r.reason, r.line,
+                            getattr(r, "via", None), "pending",
                         ),
                     )
 
-        # Refresh FTS после изменений
         self.conn.execute(
             "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')"
         )
