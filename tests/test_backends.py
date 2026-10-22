@@ -240,6 +240,11 @@ def test_normalize_response_no_tool_calls():
 
 
 def test_normalize_response_null_content_with_tool_call():
+    """llama.cpp отдаёт content=None + tool_calls без id/type.
+
+    После нормализации: content="", tool_calls в полном OpenAI-формате
+    (id сгенерирован, type="function", arguments — dict).
+    """
     data = {"choices": [{"message": {
         "content": None,
         "tool_calls": [{
@@ -251,12 +256,54 @@ def test_normalize_response_null_content_with_tool_call():
     }}]}
     out = LlamaCppBackend._normalize_response(data)
     assert out["message"]["content"] == ""
-    assert out["message"]["tool_calls"] == [
-        {"function": {
-            "name": "read_file",
-            "arguments": {"path": "a.txt"},
-        }}
-    ]
+    calls = out["message"]["tool_calls"]
+    assert len(calls) == 1
+    tc = calls[0]
+    assert tc["function"] == {
+        "name": "read_file",
+        "arguments": {"path": "a.txt"},
+    }
+    assert tc["type"] == "function"
+    assert tc["id"].startswith("call_")
+
+  
+def test_normalize_response_preserves_id_and_type():
+    """Если llama-server вернул id/type — они сохраняются как есть."""
+    data = {"choices": [{"message": {
+        "content": "",
+        "tool_calls": [{
+            "id": "call_xyz",
+            "type": "function",
+            "function": {"name": "list_dir",
+                         "arguments": {"path": "."}},
+        }],
+    }}]}
+    out = LlamaCppBackend._normalize_response(data)
+    tc = out["message"]["tool_calls"][0]
+    assert tc["id"] == "call_xyz"
+    assert tc["type"] == "function"
+    assert tc["function"] == {
+        "name": "list_dir",
+        "arguments": {"path": "."},
+    }
+
+
+def test_normalize_response_generates_id_when_missing():
+    """Если id отсутствует — генерируется уникальный call_*."""
+    data = {"choices": [{"message": {
+        "content": "",
+        "tool_calls": [{
+            "function": {"name": "read_file",
+                         "arguments": {"path": "a.txt"}},
+        }],
+    }}]}
+    out1 = LlamaCppBackend._normalize_response(data)
+    out2 = LlamaCppBackend._normalize_response(data)
+    id1 = out1["message"]["tool_calls"][0]["id"]
+    id2 = out2["message"]["tool_calls"][0]["id"]
+    assert id1.startswith("call_")
+    assert id2.startswith("call_")
+    assert id1 != id2, "id должен генерироваться заново при каждом вызове"
 
 
 def test_normalize_response_arguments_already_dict():

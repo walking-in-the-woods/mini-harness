@@ -39,6 +39,10 @@ LLAMACPP_TIMEOUT=300
 | `/dump <name> [sub]` | Содержимое → `input/_dump_<name>.md` |
 | `/reload` | Перечитать `sources.yaml` |
 | `/batch <src> <glob> <prompt>` | Пакетная обработка |
+| `/atlas rebuild` | Полная переиндексация графа Atlas |
+| `/atlas refresh` | Инкрементальная переиндексация |
+| `/atlas stats` | Статистика графа |
+| `/atlas overview` | Сжатый обзор проекта |
 
 ## Рабочая папка
 
@@ -98,10 +102,41 @@ code> <неверный>    ← отмена
 - `Makefile`, `Dockerfile*`, `docker-compose*`, `package.json`,
   `setup.py`, `pyproject.toml`, `.github/workflows/*`
 
+## Atlas: семантический граф проекта
+
+Управление Atlas без REPL и без сервера инференса:
+
+```bash
+scripts/atlas-setup.sh init      # полная переиндексация
+scripts/atlas-setup.sh refresh   # инкремент по SHA-256
+scripts/atlas-setup.sh stats     # файлы, узлы, рёбра
+scripts/atlas-setup.sh clean     # удалить graph.db и atlas.log
+```
+
+Инструмент `atlas` для модели (6 операций, все read-only):
+
+```text
+atlas(op="overview")               — обзор проекта (≤200 токенов)
+atlas(op="search", arg="foo")      — поиск узлов (≤80 токенов)
+atlas(op="card",   arg="qname")    — карточка узла (≤150 токенов)
+atlas(op="callers" | "callees", arg="qname") — связи (≤120)
+atlas(op="impact", arg="qname")    — кто зависит (≤180)
+```
+
+Отключается одной строкой в `config.yaml`:
+
+```yaml
+atlas:
+  enabled: false
+```
+
+Подробности — [Project Atlas](atlas.md).
+
 ## Логи
 
 ```bash
-tail -f logs/audit.jsonl
+tail -f logs/audit.jsonl      # что модель вызывала
+tail -f logs/atlas.log        # индексация Atlas
 ```
 
 ## Полезные команды
@@ -133,12 +168,16 @@ SMOKE_MODEL_SMALL=<маленькая модель> \
 | Раундов с инструментами | `HARNESS_MAX_TOOL_ROUNDS` | 4 |
 | Элементов в `list_dir` | `HARNESS_MAX_LIST_ENTRIES` | 500 |
 | Таймаут llama.cpp | `LLAMACPP_TIMEOUT` | 300 |
+| Бюджет `atlas(overview)` | `atlas.budget_overview` | 200 |
+| Бюджет `atlas(card)` | `atlas.budget_card` | 150 |
 
 ## Что делать при проблеме
 
 1. `logs/audit.jsonl` — что модель вызывала, какие `backend_error`.
 2. `docs/troubleshooting.md` — типовые ситуации.
 3. `docs/backends.md` — специфика llama.cpp vs ollama.
+4. `docs/atlas.md` — если Atlas не индексирует или модель его
+   не вызывает.
 
 ## Не забыть
 
@@ -149,3 +188,5 @@ SMOKE_MODEL_SMALL=<маленькая модель> \
   именовании файлов.
 - **При llama.cpp** — `HARNESS_NUM_CTX` в `.env` согласуйте с
   `--ctx-size` сервера вручную.
+- **Atlas не индексирует сам по себе** — после `git pull` выполните
+  `scripts/atlas-setup.sh refresh` или `/atlas refresh` в REPL.

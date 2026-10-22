@@ -13,6 +13,14 @@
 Chunked-обработка: config/processing.yaml — читается при старте,
 передаётся в BatchRunner. Опционален, отсутствие файла — дефолты.
 
+Project Atlas: секция atlas: в config.yaml. По умолчанию (см.
+atlas.auto_index_on_start) НЕ индексирует проект при старте —
+только открывает/создаёт пустую БД. Индексация запускается явно:
+    /atlas rebuild
+    /atlas refresh
+Инструмент atlas(op, arg, id) добавляется в HarnessAgent только
+если Atlas сконфигурирован; read-only, без сети.
+
 Команды пользователя (не модели):
   /sources                     список источников
   /tree <name> [subpath]       дерево -> input/_tree_<name>.md
@@ -21,6 +29,8 @@ Chunked-обработка: config/processing.yaml — читается при �
   /reload                      перечитать sources.yaml
   /batch <src> <glob> <prompt> [<target>] [--mode=code|docs] [--chunk]
                                пакетная обработка директории
+  /atlas rebuild|refresh|stats|overview
+                               ручное управление графом Atlas
 """
 
 from __future__ import annotations
@@ -64,6 +74,7 @@ BANNER_TEMPLATE = """
   /reset — новая сессия (сброс состояния)
   /sources, /tree, /files, /dump, /reload — внешние источники
   /batch <src> <glob> <prompt> [<target>] — пакетная обработка
+  /atlas rebuild|refresh|stats|overview — карта проекта
 ============================================================
 """
 
@@ -211,6 +222,7 @@ def load_runtime_config() -> dict:
         "max_list_entries": _env_int("HARNESS_MAX_LIST_ENTRIES", 500),
         "fs": fs_cfg,
         "proxy": proxy_cfg,
+        "atlas": raw.get("atlas") or {},
         "proxy_timeout": _env_float("HARNESS_PROXY_TIMEOUT", 30.0),
         "proxy_max_request": _env_int(
             "HARNESS_PROXY_MAX_REQUEST_BYTES", 100_000
@@ -431,15 +443,45 @@ def _handle_batch_command(user_input: str, agent: HarnessAgent,
     return True
 
 
+# ── Команды Atlas ─────────────────────────────────────────────────────────
+
+def _handle_atlas_command(user_input: str, atlas_facade) -> bool:
+    """Обрабатывает /atlas <subcommand>.
+
+    Подкоманды:
+        rebuild  — полная переиндексация (alias: init)
+        refresh  — инкрементальная переиндексация
+        stats    — статистика по графу
+        overview — ручной вызов Root View (для отладки)
+    """
+    if not user_input.startswith("/atlas"):
+        return False
+
+    if atlas_facade is None:
+        print("[!] atlas отключён в config.yaml (atlas.enabled=false) "
+              "или не удалось инициализировать")
+        return True
+
+    parts = user_input.split(maxsplit=1)
+    sub = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub in ("rebuild", "init"):
+        print(atlas_facade.rebuild())
+    elif sub == "refresh":
+        print(atlas_facade.refresh())
+    elif sub == "stats":
+        print(atlas_facade.stats())
+    elif sub == "overview":
+        print(atlas_facade.overview())
+    else:
+        print("usage: /atlas rebuild|init|refresh|stats|overview")
+    return True
+
+
 # ── Диагностика бэкенда ───────────────────────────────────────────────────
 
 def _backend_diagnose(backend: ChatBackend, cfg: dict) -> None:
-    """Информационная проверка бэкенда. Не блокирует запуск.
-
-    Печатает строку "[i] ..." если сервер не отвечает. Точная
-    подсказка зависит от бэкенда: у ollama это "ollama serve
-    запущен?", у llama.cpp — "llama-server запущен?".
-    """
+    """Информационная проверка бэкенда. Не блокирует запуск."""
     try:
         ok = backend.health()
     except Exception:
@@ -462,6 +504,34 @@ def _backend_diagnose(backend: ChatBackend, cfg: dict) -> None:
     else:
         print(f"[i] Бэкенд {backend.name!r} не отвечает. "
               f"Проверьте адрес и запуск сервера.")
+
+
+# ── Инициализация Atlas ───────────────────────────────────────────────────
+
+def _init_atlas(cfg: dict):
+    """Создать AtlasFacade, если он включён в config.yaml.
+
+    Не блокирует старт: открыть/создать пустую БД дёшево. Полная
+    индексация выполняется только если в config.yaml стоит
+    atlas.auto_index_on_start: true — и это тоже ловится try/except,
+    чтобы REPL не падал из-за проблем Atlas.
+
+    Возвращает (facade_or_None, status_message_or_None).
+    """
+    raw = cfg.get("atlas") or {}
+    if not raw.get("enabled", True):
+        return None, None
+    try:
+        from harness.atlas.config import AtlasConfig
+        from harness.atlas.facade import AtlasFacade
+        atlas_cfg = AtlasConfig.from_dict(raw)
+        facade = AtlasFacade(atlas_cfg, BASE_DIR)
+        status = facade.ensure_indexed()
+        return facade, status
+    except Exception as e:
+        print(f"[warn] atlas disabled: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None, None
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -535,7 +605,15 @@ def main() -> None:
                 model=cfg["model"],
                 backend=backend.name)
 
-    agent = HarnessAgent(cfg, guard, proxy, audit, backend=backend)
+    # Atlas — до создания агента: инструмент atlas должен присутствовать
+    # в списке tools с первого раунда. Ошибки не фатальны, индексация
+    # при старте — только если явно включена в конфиге.
+    atlas_facade, atlas_status = _init_atlas(cfg)
+    if atlas_status:
+        print(f"[i] {atlas_status}", file=sys.stderr)
+
+    agent = HarnessAgent(cfg, guard, proxy, audit,
+                         backend=backend, atlas=atlas_facade)
 
     while True:
         try:
@@ -550,8 +628,11 @@ def main() -> None:
             break
         if user_input == "/reset":
             agent = HarnessAgent(cfg, guard, proxy, audit,
-                                  backend=backend)
+                                  backend=backend, atlas=atlas_facade)
             print("[session reset]")
+            continue
+
+        if _handle_atlas_command(user_input, atlas_facade):
             continue
 
         if _handle_source_command(user_input, registry, workspace):
@@ -604,6 +685,8 @@ def main() -> None:
                     agent.mark_written(w["canonical"])
 
     audit.write("session_end")
+    if atlas_facade is not None:
+        atlas_facade.close()
 
 
 if __name__ == "__main__":

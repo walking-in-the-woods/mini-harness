@@ -11,21 +11,26 @@ ollama по версиям pydantic).
 1. function.arguments приходит JSON-строкой (OpenAI-формат), а не
    dict. Нормализуем в dict, чтобы агент не думал о разнице.
 
-2. Параметры num_ctx и keep_alive игнорируются: контекст задаётся
+2. tool_calls сохраняют OpenAI-поля id и type — llama-server с
+   --jinja требует их в истории сообщений на следующем раунде.
+   Без них второй раунд падает с
+   "Missing tool call type: {...}". Если id не пришёл, генерируем.
+
+3. Параметры num_ctx и keep_alive игнорируются: контекст задаётся
    при старте сервера (--ctx-size), модель всегда в RAM.
 
-3. think=False игнорируется: у llama.cpp нет reasoning-фазы,
+4. think=False игнорируется: у llama.cpp нет reasoning-фазы,
    chat-template решает, будет ли модель рассуждать.
 
-4. Таймаут по умолчанию — 300 секунд. На N100+7B Q4 генерация
+5. Таймаут по умолчанию — 300 секунд. На N100+7B Q4 генерация
    идёт ~2–4 t/s; ответ на 1024 токенов занимает 4–8 минут.
    30-секундный дефолт (как у ApiProxy) здесь неприемлем.
 
-5. /v1/models может отдавать два формата: OpenAI
+6. /v1/models может отдавать два формата: OpenAI
    {"object":"list","data":[{"id":...}]} и расширенный
    {"models":[{"name":...}]} (свежие сборки). Обрабатываем оба.
 
-6. Health-check — GET /health (специфично для llama-server,
+7. Health-check — GET /health (специфично для llama-server,
    не OpenAI).
 """
 
@@ -106,7 +111,14 @@ class LlamaCppBackend(ChatBackend):
         """OpenAI → формат ollama-совместимого ответа.
 
         {"choices": [{"message": {...}}]} → {"message": {...}}
+
+        tool_calls сохраняют OpenAI-форму: id + type + function.
+        llama-server с --jinja требует id и type в истории
+        сообщений — без них второй раунд падает с
+        "Missing tool call type". Если id не пришёл — генерируем.
         """
+        import uuid
+
         choices = data.get("choices") or [{}]
         choice = choices[0] if choices else {}
         msg = choice.get("message") or {}
@@ -138,8 +150,11 @@ class LlamaCppBackend(ChatBackend):
             else:
                 args = {}
 
+            call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
             tool_calls.append({
-                "function": {"name": name, "arguments": args}
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args},
             })
 
         return {
