@@ -16,12 +16,13 @@ class NodeRow:
     start_line: int
     end_line: int
     summary: str | None
+    contracts: str | None
     generation_hash: str
 
 
 _NODE_COLS = (
     "id,kind,name,qualified_name,path,start_line,end_line,"
-    "summary,generation_hash"
+    "summary,contracts,generation_hash"
 )
 
 
@@ -48,14 +49,14 @@ class GraphQueries:
         try:
             cur = self.conn.execute(
                 "SELECT n.id,n.kind,n.name,n.qualified_name,n.path,"
-                "n.start_line,n.end_line,n.summary,n.generation_hash "
+                "n.start_line,n.end_line,n.summary,n.contracts,"
+                "n.generation_hash "
                 "FROM nodes_fts f JOIN nodes n ON n.rowid=f.rowid "
                 "WHERE nodes_fts MATCH ? ORDER BY rank LIMIT ?",
                 (query, limit),
             )
             return [NodeRow(*r) for r in cur.fetchall()]
         except sqlite3.OperationalError:
-            # FTS-синтаксис мог не понравиться — fallback по LIKE
             like = f"%{query}%"
             cur = self.conn.execute(
                 f"SELECT {_NODE_COLS} FROM nodes "
@@ -66,7 +67,7 @@ class GraphQueries:
 
     def incoming(self, node_id: str, kind: str | None = None) -> list[dict[str, Any]]:
         sql = (
-            "SELECT e.src_id, e.kind, e.status, e.reason, e.line, "
+            "SELECT e.src_id, e.kind, e.status, e.reason, e.line, e.via, "
             "n.qualified_name, n.path "
             "FROM edges e JOIN nodes n ON n.id=e.src_id WHERE e.dst_id=?"
         )
@@ -76,7 +77,8 @@ class GraphQueries:
             params.append(kind)
         return [
             dict(zip(
-                ("src_id", "kind", "status", "reason", "line", "qname", "path"),
+                ("src_id", "kind", "status", "reason", "line", "via",
+                 "qname", "path"),
                 r,
             ))
             for r in self.conn.execute(sql, params).fetchall()
@@ -84,7 +86,7 @@ class GraphQueries:
 
     def outgoing(self, node_id: str, kind: str | None = None) -> list[dict[str, Any]]:
         sql = (
-            "SELECT e.dst_id, e.kind, e.status, e.reason, e.line, "
+            "SELECT e.dst_id, e.kind, e.status, e.reason, e.line, e.via, "
             "n.qualified_name, n.path "
             "FROM edges e JOIN nodes n ON n.id=e.dst_id WHERE e.src_id=?"
         )
@@ -94,7 +96,8 @@ class GraphQueries:
             params.append(kind)
         return [
             dict(zip(
-                ("dst_id", "kind", "status", "reason", "line", "qname", "path"),
+                ("dst_id", "kind", "status", "reason", "line", "via",
+                 "qname", "path"),
                 r,
             ))
             for r in self.conn.execute(sql, params).fetchall()

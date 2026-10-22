@@ -1,4 +1,4 @@
-"""DDL для SQLite-графа Atlas (ФТ-11…ФТ-15)."""
+"""DDL и миграции для SQLite-графа Atlas (ФТ-11…ФТ-15)."""
 from __future__ import annotations
 
 import sqlite3
@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     start_line      INTEGER NOT NULL,
     end_line        INTEGER NOT NULL,
     summary         TEXT,
+    contracts       TEXT,
     generation_hash TEXT NOT NULL,
     FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
 );
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS edges (
     status          TEXT NOT NULL DEFAULT 'confirmed',
     reason          TEXT,
     line            INTEGER,
+    via             TEXT,
     generation_hash TEXT NOT NULL,
     PRIMARY KEY (src_id, kind, dst_id, line),
     FOREIGN KEY(src_id) REFERENCES nodes(id) ON DELETE CASCADE,
@@ -61,10 +63,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 """
 
 
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Миграция: добавить колонки, которых нет в старых БД.
+
+    Идемпотентно: проверяем PRAGMA table_info перед ALTER.
+    Для новых БД (созданных через текущий DDL) эти колонки уже
+    есть — ALTER не выполняется.
+    """
+    node_cols = {row[1] for row in conn.execute("PRAGMA table_info(nodes)")}
+    if "contracts" not in node_cols:
+        conn.execute("ALTER TABLE nodes ADD COLUMN contracts TEXT")
+
+    edge_cols = {row[1] for row in conn.execute("PRAGMA table_info(edges)")}
+    if "via" not in edge_cols:
+        conn.execute("ALTER TABLE edges ADD COLUMN via TEXT")
+
+
 def init_db(db_path: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=timeout)
     conn.executescript(DDL)
+    _ensure_columns(conn)
     conn.commit()
     return conn
