@@ -8,6 +8,7 @@
 - [Внешние источники](sources.md) — проекты и базы знаний вне workspace
 - [Prompt-файлы](prompt-files.md) — пользовательские инструкции для guided mode
 - [Batch-режим](batch.md) — пакетная обработка директории
+- [Project Atlas](atlas.md) — семантический граф проекта, инструмент `atlas`
 - [Внешние API](api-proxy.md) — маршруты и добавление своих
 - [Модель угроз](security-model.md) — что защищено, что нет
 - [Разработка](development.md) — тесты и CI

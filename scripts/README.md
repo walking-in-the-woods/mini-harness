@@ -4,6 +4,7 @@
 
 - [Быстрый старт](#быстрый-старт)
 - [llama-server.sh — единый запускатель](#llama-server-единый-запускатель)
+- [Atlas: индексация без REPL](#atlas-индексация-без-repl)
 - [Полный цикл batch-проверки](#полный-цикл-batch-проверки)
 - [Переключение между моделями](#переключение-между-моделями)
 - [Диагностика](#диагностика)
@@ -141,6 +142,82 @@ HEALTH_TIMEOUT=180 OPEN_BROWSER=false $SCRIPT use 7b
 
 ---
 
+## Atlas: индексация без REPL
+
+`scripts/atlas-setup.sh` управляет семантическим графом Project Atlas.
+Не требует `llama-server`/`ollama` и вообще не обращается к модели —
+это чисто Python + SQLite.
+
+**Зачем отдельный скрипт:** команды `/atlas` доступны только внутри
+REPL, а REPL без сервера инференса бесполезен. `atlas-setup.sh`
+позволяет проиндексировать проект *до* первого запуска REPL, чтобы
+старт был мгновенным (`atlas.auto_index_on_start: false` по
+умолчанию).
+
+### Команды
+
+| Команда | Что делает |
+| --- | --- |
+| `init` / `rebuild` | Полная переиндексация. Создаёт `graph.db`, если её нет |
+| `refresh` | Инкрементальная переиндексация по SHA-256 (изменённые файлы) |
+| `stats` | Файлы, узлы, рёбра, размер БД, `generation_hash` |
+| `clean` | Удалить `graph.db` и `atlas.log` (с подтверждением) |
+
+### Пример
+
+```bash
+# Один раз проиндексировать проект
+scripts/atlas-setup.sh init
+# [atlas] rebuilt: 47 files, errors=0, 0.9s
+
+# Периодически обновлять после git pull / правок
+scripts/atlas-setup.sh refresh
+# [atlas] refreshed: 3 indexed, 0 deleted, errors=0, 0.2s
+
+# Посмотреть, что в графе
+scripts/atlas-setup.sh stats
+# [atlas] files=47 nodes=812 edges=2140 db=196608B gen=ab12cd34ef56
+```
+
+### Где хранится граф
+
+По умолчанию — `workspace/.atlas/graph.db`. Путь задаётся в
+`config.yaml → atlas.db_path`. Можно указать абсолютный путь или
+путь вне `workspace/` (например, `logs/.atlas/graph.db`), если не
+хотите держать БД внутри рабочей директории.
+
+### Что индексируется
+
+Корень индексации — `atlas.workspace_root` из `config.yaml`
+(по умолчанию `workspace`). Чтобы Atlas смотрел на сам проект
+`mini-harness`, поставьте:
+
+```yaml
+atlas:
+  workspace_root: "."
+```
+
+и выполните `scripts/atlas-setup.sh init`.
+
+### Если Atlas не нужен
+
+Атлас — полностью опциональная подсистема. Отключается одной
+строкой в `config.yaml`:
+
+```yaml
+atlas:
+  enabled: false
+```
+
+При этом:
+- `/atlas ...` в REPL отвечает `atlas отключён в config.yaml`;
+- инструмент `atlas` не появляется в списке tools модели;
+- `graph.db` не открывается;
+- остальная функциональность (guided mode, batch, sources) не
+  затрагивается.
+
+---
+
 ## Полный цикл batch-проверки
 
 Пример для Qwen3-4B-Instruct-2507 (alias `4b`) на N100.
@@ -266,6 +343,27 @@ pkill -f llama-server
 grep -E '^(HARNESS_BACKEND|HARNESS_MODEL|LLAMACPP_HOST|HARNESS_NUM_CTX|LLAMACPP_TIMEOUT)=' .env
 ```
 
+### Atlas не отвечает / пустой граф
+
+```bash
+# Статус: индексирован ли проект
+scripts/atlas-setup.sh stats
+# [atlas] not indexed (run /atlas rebuild)
+
+# Полная переиндексация
+scripts/atlas-setup.sh init
+
+# Проверить, что БД создана
+ls -la workspace/.atlas/graph.db
+
+# Лог индексации
+tail -20 logs/atlas.log
+
+# Если что-то пошло не так — снести и начать заново
+scripts/atlas-setup.sh clean
+scripts/atlas-setup.sh init
+```
+
 ---
 
 ## Добавление новой модели
@@ -307,9 +405,12 @@ grep -E '^(HARNESS_BACKEND|HARNESS_MODEL|LLAMACPP_HOST|HARNESS_NUM_CTX|LLAMACPP_
 | Скрипт | Назначение |
 | --- | --- |
 | `llama-server.sh` | Единый запускатель llama.cpp-серверов (этот файл) |
+| `atlas-setup.sh` | Управление графом Project Atlas (`init` / `refresh` / `stats` / `clean`) |
 | `setup-workspace.sh` | Идемпотентная инициализация `workspace/` и `logs/` |
 | `setup-experiments.sh` | Готовит структуру `docs/experiments/` для публикации |
 | `check-public-safety.sh` | Аудит перед публикацией: секреты, ключи, личные пути |
 
-Все три вызываются из `run.sh` автоматически, отдельный запуск
-нужен редко.
+`llama-server.sh` вызывается вручную по необходимости,
+`atlas-setup.sh` — тоже. `setup-workspace.sh` вызывается из `run.sh`
+автоматически. `setup-experiments.sh` и `check-public-safety.sh` —
+только вручную перед публикацией.

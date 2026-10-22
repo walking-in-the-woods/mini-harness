@@ -73,3 +73,42 @@ proxy:
     translate: "https://api.mymemory.translated.net/get"
     fake-data: "https://jsonplaceholder.typicode.com/posts"
     countries: "https://restcountries.com/v3.1/all"
+
+# ── Project Atlas (MH-ATLAS-001) ──────────────────────────────────────────
+# Семантический граф проекта на SQLite + read-only инструмент atlas
+# для LLM-агента. Полностью локально, без сети.
+#
+# Поведение по умолчанию — «пассивное»: Atlas не делает ничего при
+# старте REPL, кроме открытия/создания пустой БД. Индексация
+# запускается только явно:
+#
+#   /atlas rebuild    полная переиндексация (нужна при первом запуске)
+#   /atlas refresh    инкрементальная (после git pull и правок)
+#
+# Если хотите, чтобы первая индексация выполнялась автоматически при
+# старте, установите auto_index_on_start: true. На больших проектах
+# (тысячи файлов) это задержит появление REPL — по умолчанию выключено.
+atlas:
+  enabled: true
+  auto_index_on_start: false
+  workspace_root: "workspace"    # корень индексируемого проекта
+  db_path: "workspace/.atlas/graph.db"
+  log_path: "logs/atlas.log"
+  max_depth: 3
+  budget_overview: 200
+  budget_search: 80
+  budget_card: 150
+  budget_callers: 120
+  budget_callees: 120
+  budget_impact: 180
+  sanitize_max_name_len: 80
+  sanitize_max_summary_len: 300
+  python_extensions: [".py"]
+  ignore_dirs:
+    - ".git"
+    - "__pycache__"
+    - ".venv"
+    - "venv"
+    - "node_modules"
+    - ".atlas"
+    - ".pytest_cache"

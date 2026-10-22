@@ -53,6 +53,19 @@ retry_hint позволяет batch-режиму передать коротки
 tool_calls от ollama >= 0.4 приходят как dataclass-объекты, не dict —
 нормализуем в _tool_call_to_dict. LlamaCppBackend нормализует
 аргументы tool_call в dict сам (OpenAI отдаёт их JSON-строкой).
+
+Формат tool_calls: в истории сообщений assistant.tool_calls и
+role=tool должны содержать OpenAI-поля id/type/tool_call_id.
+llama-server с --jinja без них падает на втором раунде с
+"Missing tool call type". _run_autonomous нормализует tool_calls
+перед добавлением в messages; если id/type не пришли от бэкенда —
+генерирует.
+
+Project Atlas: если в конструктор передан `atlas`, в список tools
+добавляется инструмент atlas(op, arg, id) — read-only карта проекта
+(см. harness/atlas/). Дополнительно в system-промпт добавляется
+_ATLAS_HINT с инструкцией, когда и как вызывать atlas. Без `atlas`
+поведение полностью прежнее.
 """
 
 from __future__ import annotations
@@ -61,9 +74,10 @@ import json
 import logging
 import re
 import sys
+import uuid
 from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from harness.audit import AuditLog
 from harness.backends import (
@@ -74,6 +88,10 @@ from harness.backends import (
 from harness.fs_guard import FileSystemGuard
 from harness.injection_guard import InjectionGuard
 from harness.proxy import ApiProxy
+
+
+if TYPE_CHECKING:
+    from harness.atlas.facade import AtlasFacade
 
 
 log = logging.getLogger(__name__)
@@ -110,6 +128,28 @@ RULES:
    If you must give the user a script, save it as .txt.
 4. Stay inside the workspace. Never attempt paths outside it.
 5. Answer concisely in the user's language.
+"""
+
+
+# Добавляется к SYSTEM_PROMPT только если Atlas сконфигурирован.
+# Без этой инструкции 4B-модели видят инструмент в списке, но не
+# понимают, зачем он нужен, и отвечают из обучающих данных вместо
+# вызова atlas(op="card", ...). Особенно важно для llama.cpp+chatml,
+# где tool-calling ненадёжен.
+_ATLAS_HINT = """\
+
+ATLAS (semantic project map, read-only):
+- Use atlas(op="search", arg="<query>") to find a symbol by name.
+- Use atlas(op="card", arg="<qualified_name>") to get its details
+  (signature, summary, immediate calls).
+- Use atlas(op="callers"|"callees"|"impact", arg="<qualified_name>")
+  to navigate dependencies.
+- PREFER atlas over read_file when the question is about STRUCTURE
+  ("how is X organized", "who calls Y", "what depends on Z").
+- Do NOT use atlas(op="overview", arg=...) — overview IGNORES arg;
+  it always returns a whole-project summary.
+- If atlas returns "not indexed", the graph is not built yet — fall
+  back to read_file.
 """
 
 
@@ -442,7 +482,12 @@ def _try_parse_json(chunk: str) -> Any:
 
 
 def _extract_tool_calls_from_content(content: str) -> list[dict]:
-    """Извлечь tool calls из текстового content (fallback)."""
+    """Извлечь tool calls из текстового content (fallback).
+
+    Возвращает список в полном OpenAI-формате: id + type + function.
+    Иначе на втором раунде llama-server с --jinja падает с
+    "Missing tool call type".
+    """
     if not content or "{" not in content:
         return []
 
@@ -491,8 +536,11 @@ def _extract_tool_calls_from_content(content: str) -> list[dict]:
             arguments = obj.get("arguments")
             if (isinstance(name, str) and name
                     and isinstance(arguments, dict)):
-                calls.append({"function": {"name": name,
-                                            "arguments": arguments}})
+                calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                })
         i = end
 
     return calls
@@ -587,18 +635,24 @@ class HarnessAgent:
 
     3. Ничего не передано — build_backend(cfg) по cfg["backend"].
        Значение по умолчанию — "ollama".
+
+    Project Atlas: если передан atlas=<AtlasFacade>, в список tools
+    добавляется инструмент atlas(op, arg, id), а в system-промпт —
+    _ATLAS_HINT. Read-only. Без atlas поведение идентично прежнему.
     """
 
     def __init__(self, cfg: dict, fs_guard: FileSystemGuard,
                  proxy: ApiProxy, audit: AuditLog, *,
                  client: Any | None = None,
-                 backend: ChatBackend | None = None):
+                 backend: ChatBackend | None = None,
+                 atlas: "AtlasFacade | None" = None):
         self.cfg = cfg
         self.workspace = Path(cfg["workspace_root"]).resolve()
         self.fs_guard = fs_guard
         self.proxy = proxy
         self.injection = InjectionGuard()
         self.audit = audit
+        self.atlas = atlas
 
         self.model = cfg["model"]
         self.num_ctx = int(cfg["num_ctx"])
@@ -933,11 +987,39 @@ class HarnessAgent:
 
         return text or None
 
+    # ------------------------ tool schemas ---------------------------------
+
+    def _tool_schemas(self) -> list[dict]:
+        """Список схем инструментов для модели.
+
+        Atlas добавляется только если фасад сконфигурирован — иначе
+        модель не знает о его существовании и не пытается его
+        вызвать. Импорт atlas_tool_schema локальный: не тащим пакет
+        atlas, если он не используется.
+        """
+        tools = list(TOOLS)
+        if self.atlas is not None:
+            from harness.atlas.facade import atlas_tool_schema
+            tools.append(atlas_tool_schema())
+        return tools
+
+    def _system_prompt(self) -> str:
+        """System-промпт с учётом конфигурации.
+
+        Базовый SYSTEM_PROMPT всегда. _ATLAS_HINT — только если
+        Atlas сконфигурирован: без него модели видят инструмент
+        atlas в списке, но не понимают, когда его вызывать, и
+        отвечают из обучающих данных.
+        """
+        if self.atlas is None:
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT + _ATLAS_HINT
+
     # ------------------------ autonomous mode ------------------------------
 
     def _run_autonomous(self, user_prompt: str) -> dict:
         messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -950,7 +1032,7 @@ class HarnessAgent:
                 resp = self.backend.chat(
                     model=self.model,
                     messages=messages,
-                    tools=TOOLS,
+                    tools=self._tool_schemas(),
                     think=False,
                     temperature=self.temperature,
                     num_predict=self.num_predict,
@@ -996,6 +1078,26 @@ class HarnessAgent:
                     "pending_writes": list(self.proposed_writes),
                 }
 
+            # Нормализуем tool_calls в полный OpenAI-формат: каждый
+            # должен иметь id и type. llama.cpp с --jinja без них
+            # падает на втором раунде с "Missing tool call type".
+            normalized_calls: list[dict] = []
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                name_n = fn.get("name")
+                if not isinstance(name_n, str) or not name_n:
+                    continue
+                call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                normalized_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name_n,
+                        "arguments": fn.get("arguments") or {},
+                    },
+                })
+            tool_calls = normalized_calls
+
             assistant_msg: dict = {"role": "assistant", "content": content}
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
@@ -1017,7 +1119,11 @@ class HarnessAgent:
             result_text = self._dispatch(name, args)
             self.audit.write("tool_result", tool=name,
                              preview=result_text[:500])
-            messages.append({"role": "tool", "content": result_text})
+            messages.append({
+                "role": "tool",
+                "content": result_text,
+                "tool_call_id": tc.get("id") or "",
+            })
 
         return {
             "text": "[STOP] Бюджет вызовов инструментов исчерпан.",
@@ -1071,6 +1177,14 @@ class HarnessAgent:
                 return self._tool_api_call(
                     args.get("route", ""), args.get("method", "GET"),
                     args.get("params") or {}, args.get("body"),
+                )
+            if name == "atlas":
+                if self.atlas is None:
+                    return "ERROR: atlas не сконфигурирован"
+                return self.atlas.call(
+                    args.get("op", ""),
+                    args.get("arg", ""),
+                    args.get("id", ""),
                 )
             return f"ERROR: unknown tool {name!r}"
         except Exception as e:

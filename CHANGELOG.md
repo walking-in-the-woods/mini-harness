@@ -7,8 +7,128 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Project Atlas — MVP (Python-only).** Подсистема семантического
+  графа проекта на SQLite + read-only инструмент `atlas(op, arg, id)`
+  для LLM-агента. Цель — снизить объём контекста при навигации по
+  коду не менее чем на 90% и убрать галлюцинации о структуре.
+  Полностью локально, без сети, без новых зависимостей
+  (`ast`, `sqlite3`, `hashlib`).
+  - **`harness/atlas/`** — новый пакет:
+    - `config.py` — `AtlasConfig` из секции `atlas:` в `config.yaml`.
+    - `gitignore.py` — мини-парсер `.gitignore` → regex (без
+      `pathspec`).
+    - `indexer/walker.py` — обход дерева с учётом `.gitignore` и
+      `ignore_dirs`.
+    - `indexer/python_ast.py` — извлечение узлов и рёбер из `ast`.
+    - `evidence/resolver.py` — разрешение рёбер до `dst_id` с
+      `status` (`confirmed` / `unresolved`) и `reason`.
+    - `store/schema.py` — DDL: `meta`, `files`, `nodes`, `edges`,
+      `nodes_fts` (FTS5).
+    - `store/queries.py` — get, find, search, incoming/outgoing,
+      stats.
+    - `formatter/budget.py` — `estimate_tokens`, `enforce_budget`.
+    - `formatter/capsule.py` — overview / search / card / callers /
+      callees / impact с жёсткими бюджетами.
+    - `security/sanitizer.py` — обрезка, фильтрация injection-
+      паттернов, redaction секретов.
+    - `lifecycle/manager.py` — полная и инкрементальная индексация
+      по SHA-256, транзакция на файл.
+    - `facade.py` — `AtlasFacade.call(op, arg, id)`,
+      `rebuild/refresh/stats/overview`, `ensure_indexed`.
+    - `cli.py` — CLI для `scripts/atlas-setup.sh`.
+  - **`scripts/atlas-setup.sh`** — управление графом без REPL и без
+    сервера инференса. Команды: `init` / `rebuild`, `refresh`,
+    `stats`, `clean`, `help`.
+  - **`/atlas rebuild|init|refresh|stats|overview`** — команды REPL.
+    Обрабатываются в `main.py`, не уходят в модель.
+  - **Инструмент `atlas` для модели** — схема ≤ 80 токенов,
+    read-only, 6 операций (`overview`, `search`, `card`, `callers`,
+    `callees`, `impact`). Добавляется в `HarnessAgent.tools` только
+    если Atlas сконфигурирован. В `system`-промпт при этом
+    добавляется `_ATLAS_HINT` с инструкцией, когда и как вызывать
+    `atlas`.
+  - **`config.yaml → atlas:`** — новая секция с дефолтами.
+    Ключевое: `enabled: true` (подсистема включена) и
+    `auto_index_on_start: false` (по умолчанию не индексировать при
+    старте REPL — старт мгновенный).
+  - **`docs/atlas.md`** — полная документация подсистемы: зачем,
+    как включить, формат узлов/рёбер, команды, скрипт, схема БД,
+    инкрементальная переиндексация, безопасность, ограничения MVP,
+    производительность, troubleshooting.
+  - **`tests/atlas/`** — 71 тест: gitignore, схема БД, AST-парсер,
+    resolver, sanitizer, budget, lifecycle (rebuild / refresh /
+    idempotency / generation hash), capsule / facade, интеграция
+    с `HarnessAgent._dispatch`.
+  - Ссылки на `docs/atlas.md` добавлены в `README.md`,
+    `docs/README.md`, `docs/index.md`, `docs/cheatsheet.md`.
+    Раздел про `atlas-setup.sh` добавлен в `scripts/README.md`.
+
+### Changed
+
+- **`HarnessAgent.__init__`** — новый опциональный параметр
+  `atlas: "AtlasFacade | None" = None`. Если передан — в список
+  tools добавляется `atlas`, в system-промпт — `_ATLAS_HINT`.
+  Без параметра поведение идентично прежнему.
+- **`HarnessAgent._tool_schemas()`** — новый метод. Собирает список
+  схем tools с учётом Atlas (через локальный импорт
+  `atlas_tool_schema`, чтобы не тащить пакет при `atlas=None`).
+- **`HarnessAgent._system_prompt()`** — новый метод. Возвращает
+  `SYSTEM_PROMPT` или `SYSTEM_PROMPT + _ATLAS_HINT`. Вызывается
+  из `_run_autonomous`.
+- **`LlamaCppBackend._normalize_response`** — сохраняет OpenAI-поля
+  `id` и `type` в tool_calls; если `id` не пришёл — генерирует.
+  Нужно для `llama-server --jinja`.
+- **`_extract_tool_calls_from_content`** — возвращает tool_calls
+  в полном OpenAI-формате: `id` (генерируется), `type="function"`,
+  `function: {name, arguments}`. Раньше был «голый» `{function: ...}`.
+- **`harness/main.py`** — `cfg["atlas"]` в `load_runtime_config`;
+  `_init_atlas()` (создаёт фасад, ошибки не фатальны);
+  `_handle_atlas_command()` (`/atlas ...`);
+  `atlas=atlas_facade` в оба `HarnessAgent(...)`; `atlas_facade.close()`
+  на выходе; в баннер добавлена строка про `/atlas`.
+- **`config.yaml`** — новая секция `atlas:` (16 ключей).
+
+### Fixed
+
+- **llama-server с `--jinja` падал на втором раунде tool-loop** с
+  `Failed to parse messages: Missing tool call type`. Причина:
+  `assistant.tool_calls` и `role=tool` в истории не содержали
+  `id`/`type`/`tool_call_id`, а jinja-шаблон llama.cpp требует их
+  для сопоставления вызова с результатом. Теперь `_run_autonomous`
+  нормализует `tool_calls` в полный OpenAI-формат перед помещением
+  в `messages` и добавляет `tool_call_id` в tool-сообщение.
+  Ollama-путь не затронут — формат с `id`/`type` она принимает.
+- **`atlas(op="search")` возвращал `path::name`, а `card` искал по
+  `qualified_name`.** Модель получала от `search` строку
+  `input/counter.py::Counter`, передавала её в `card`, получала
+  `node not found` и зацикливалась. Теперь `search` возвращает
+  `qualified_name` — ровно тот формат, который принимают `card`,
+  `callers`, `callees`, `impact`.
+- **`PythonAstParser` вычислял `path` из `qualified_name`** вместо
+  реального пути файла. Для функций/методов это давало `src.py`
+  вместо `src/main.py`, для вложенных классов — `src/main/MyClass.py`.
+  Нарушался `FOREIGN KEY nodes.path → files.path`, `INSERT INTO
+  nodes` падал, вся индексация разваливалась каскадом. Теперь
+  `RawNode.path` прокидывается явно из парсера как реальный путь
+  файла.
+- **`EvidenceResolver._lookup_module`** использовал `LIKE '%::module'`
+  для поиска модуля, что давало ложные срабатывания и промахи на
+  простых qname. Заменено на точное сравнение `qualified_name ==
+  module_name.replace(".", "::")`.
+
 ### Планируется
 
+- **Atlas, этап 2:** JS/TS через tree-sitter; расширенный evidence
+  (`re-export-binding`, `dynamic-dispatch` через `getattr`/`**kwargs`/
+  DI); расширенный redaction секретов.
+- **Atlas, этап 3:** LRU-кэш карточек; инкрементальный FTS вместо
+  `INSERT INTO nodes_fts('rebuild')` на каждый файл; интеграция с
+  `/batch` (группировка однотипных символов через Atlas); оптимизация
+  полной индексации под НФТ-1 (3000 файлов ≤ 60 с).
+- **Atlas, этап 4:** нагрузочное тестирование на N100; приёмочные
+  испытания на реальном проекте Заказчика.
 - Smoke-тест для llama.cpp в CI (требует живого `llama-server`,
   сейчас только юнит-тесты).
 - Retry-транспорт для `LlamaCppBackend` для удалённых серверов.

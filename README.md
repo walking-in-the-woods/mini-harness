@@ -85,6 +85,37 @@ Non-chunked режим: файлы уходят в модель целиком. 
 Файл разбивается на чанки, каждый обрабатывается отдельно.
 Подробности — в `docs/processing.md`.
 
+## Semantic map (Project Atlas)
+
+Atlas — локальный семантический граф проекта на SQLite, который
+даёт модели единый read-only инструмент `atlas(op, arg, id)` для
+навигации по коду. Снижает объём контекста при ответах на
+структурные вопросы («как устроен X», «кто вызывает Y») не менее
+чем на 90%.
+
+Atlas **полностью опционален**: по умолчанию он не индексирует
+проект при старте — только открывает пустую БД. Индексация
+запускается явно:
+
+```bash
+# Один раз проиндексировать проект
+scripts/atlas-setup.sh init
+
+# Или внутри REPL
+>>> /atlas rebuild
+>>> /atlas stats
+>>> /atlas overview
+```
+
+Если Atlas не нужен — одна строка в `config.yaml`:
+
+```yaml
+atlas:
+  enabled: false
+```
+
+Полная документация — [docs/atlas.md](docs/atlas.md).
+
 ## Запуск моделей
 
 Для Ollama — `ollama serve` + `ollama pull <model>`.
@@ -107,8 +138,8 @@ scripts/llama-server.sh stop 4b
 ## Настройка
 
 Все скалярные параметры — в `.env`. Политики путей — в `config.yaml`.
-Chunked-режим — в `config/processing.yaml`. Правки подхватываются
-при новом запуске.
+Chunked-режим — в `config/processing.yaml`. Atlas — в
+`config.yaml → atlas:`. Правки подхватываются при новом запуске.
 
 **Для машин с ограниченной памятью (Ollama):**
 
@@ -127,6 +158,8 @@ Chunked-режим — в `config/processing.yaml`. Правки подхват�
 - **`ACCESS DENIED`** — путь в blacklist или вне whitelist.
 - **`REJECTED: extension ...`** — сохраняйте скрипты как `.txt`.
 - **`FAILED: source N bytes > budget M`** — используйте `--chunk`.
+- **`[atlas] not indexed`** — выполните `/atlas rebuild` или
+  `scripts/atlas-setup.sh init`.
 - **Медленно / OOM** — уменьшите `HARNESS_NUM_CTX` или возьмите
   модель меньшего размера.
 
